@@ -38,10 +38,21 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id               = Column(String(36), primary_key=True)
+    email            = Column(String(255), nullable=False, unique=True, index=True)
+    hashed_password  = Column(String, nullable=True)   # null for Google-only accounts
+    google_sub       = Column(String(255), nullable=True, index=True)
+    created_at       = Column(DateTime, default=datetime.utcnow)
+
+
 class Audit(Base):
     __tablename__ = "audits"
 
     id               = Column(String(36), primary_key=True)
+    user_id          = Column(String(36), index=True)  # FK to users.id (soft reference)
     keyword          = Column(String(255), nullable=False, index=True)
     target_url       = Column(String(2048), nullable=False)
     location         = Column(String(255))

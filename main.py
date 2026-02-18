@@ -24,8 +24,11 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+import bcrypt as _bcrypt_lib
+from jose import JWTError, jwt as jose_jwt
 from pydantic import BaseModel, field_validator
 
 # ---------------------------------------------------------------------------
@@ -43,11 +46,16 @@ logger = logging.getLogger("seo-saas")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_DAYS = 30
 
 if not ANTHROPIC_API_KEY:
     logger.warning("⚠️  ANTHROPIC_API_KEY is not set — Claude calls will fail")
 if not SERPAPI_KEY:
     logger.warning("⚠️  SERPAPI_KEY is not set — competitor research will fail")
+if not JWT_SECRET:
+    logger.warning("⚠️  JWT_SECRET is not set — auth endpoints will fail")
 
 # ---------------------------------------------------------------------------
 # Anthropic client — ASYNC so we never block the event loop
@@ -61,7 +69,8 @@ anthropic_client = AsyncAnthropic()           # reads ANTHROPIC_API_KEY from env
 # Database
 # ---------------------------------------------------------------------------
 
-from database import Audit, SessionLocal, init_db
+from database import Audit, User, SessionLocal, init_db
+from pdf_export import build_pdf
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -145,6 +154,141 @@ class AuditRequest(BaseModel):
         if not v.startswith(("http://", "https://")):
             raise ValueError("URL must start with http:// or https://")
         return v
+
+
+# =============================================================================
+# Auth — password hashing, JWT, request models, dependency
+# =============================================================================
+
+def _hash_password(password: str) -> str:
+    return _bcrypt_lib.hashpw(password.encode(), _bcrypt_lib.gensalt()).decode()
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _bcrypt_lib.checkpw(plain.encode(), hashed.encode())
+
+
+def _create_token(user_id: str, email: str) -> str:
+    from datetime import timedelta
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS),
+    }
+    return jose_jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+class CurrentUser(BaseModel):
+    id: str
+    email: str
+
+
+def get_current_user(authorization: Optional[str] = Header(default=None)) -> CurrentUser:
+    """FastAPI dependency — validates Bearer JWT and returns the current user."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization[len("Bearer "):]
+    try:
+        payload = jose_jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id: str = payload.get("sub")
+        email: str = payload.get("email")
+        if not user_id or not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return CurrentUser(id=user_id, email=email)
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class OAuthSyncRequest(BaseModel):
+    email: str
+    google_sub: str
+    name: Optional[str] = None
+
+
+# =============================================================================
+# Auth endpoints
+# =============================================================================
+
+@app.post("/auth/register", status_code=201)
+def auth_register(body: RegisterRequest):
+    """Create a new email/password account. Called by the registration form."""
+    email = body.email.lower().strip()
+    db = SessionLocal()
+    try:
+        if db.query(User).filter(User.email == email).first():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        user = User(
+            id=str(uuid.uuid4()),
+            email=email,
+            hashed_password=_hash_password(body.password),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        token = _create_token(user.id, user.email)
+        return {"id": user.id, "email": user.email, "access_token": token}
+    finally:
+        db.close()
+
+
+@app.post("/auth/login")
+def auth_login(body: LoginRequest):
+    """
+    Verify email/password credentials. Called by NextAuth CredentialsProvider.
+    Returns access_token that NextAuth stores in the session for API calls.
+    """
+    email = body.email.lower().strip()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if not user or not user.hashed_password:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        if not _verify_password(body.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = _create_token(user.id, user.email)
+        return {"id": user.id, "email": user.email, "access_token": token}
+    finally:
+        db.close()
+
+
+@app.post("/auth/oauth-sync")
+def auth_oauth_sync(body: OAuthSyncRequest):
+    """
+    Called by NextAuth JWT callback after Google OAuth. Creates the user on first
+    sign-in, finds them on subsequent sign-ins, and returns an access_token so
+    the frontend can make authenticated FastAPI calls.
+    """
+    email = body.email.lower().strip()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            user = User(
+                id=str(uuid.uuid4()),
+                email=email,
+                google_sub=body.google_sub,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        elif not user.google_sub:
+            # Link Google to an existing email/password account
+            user.google_sub = body.google_sub
+            db.commit()
+        token = _create_token(user.id, user.email)
+        return {"id": user.id, "email": user.email, "access_token": token}
+    finally:
+        db.close()
 
 
 # =============================================================================
@@ -601,7 +745,8 @@ async def on_page_seo_agent(request: AuditRequest):
 
 LOCAL_SYSTEM = """You are a local SEO specialist focused on Google Map Pack rankings and local search dominance.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
-Your strategies are specific to the business location and industry."""
+Your citation recommendations are ALWAYS industry-specific — you never suggest the same generic list
+regardless of business type. Every citation must be relevant to the exact business vertical."""
 
 LOCAL_PROMPT = """Create a local SEO strategy for this business.
 
@@ -616,6 +761,42 @@ TARGET PAGE INFO:
 
 TOP COMPETITORS:
 {competitor_names}
+
+STEP 1 — IDENTIFY BUSINESS TYPE:
+Infer the exact business vertical from the keyword and page content
+(e.g. "dentist near me" → dental practice, "personal injury lawyer" → personal injury law firm,
+"hvac repair" → HVAC contractor, "kitchen cabinets" → kitchen cabinet retailer/installer).
+
+STEP 2 — SELECT INDUSTRY-SPECIFIC CITATIONS:
+Only recommend directories genuinely relevant to this business type.
+Use this reference list as a guide (not exhaustive):
+
+Medical/Health:     Healthgrades, Zocdoc, WebMD Doctor Finder, Vitals, RateMDs, US News Health, Castle Connolly
+Dental:             1-800-Dentist, Zocdoc, DentalPlans.com, Opencare, Authority Dental
+Legal:              Avvo, FindLaw, Martindale-Hubbell, Justia, Lawyers.com, Super Lawyers, LegalMatch
+Home Services:      HomeAdvisor, Angi, Thumbtack, Houzz, Porch, Networx, ServiceMagic
+Restaurants/Food:   OpenTable, Zomato, TripAdvisor, MenuPages, Allmenus, Foursquare, GrubHub
+Real Estate:        Zillow, Realtor.com, Trulia, Homes.com, Homesnap, LoopNet (commercial)
+Automotive:         CarGurus, AutoTrader, Cars.com, DealerRater, RepairPal (repair shops)
+Beauty/Salon:       StyleSeat, Vagaro, Booksy, Fresha, Salonory
+Fitness/Gym:        Mindbody, ClassPass, WellnessLiving
+Financial/Acctg:    FINRA BrokerCheck, CPAdirectory, NerdWallet, SmartAsset
+Hotels/Hospitality: TripAdvisor, Booking.com, Expedia, Hotels.com
+Contractors:        Houzz, BuildZoom, Porch, GuildQuality
+Home Improvement:   Houzz, Angi, HomeAdvisor, BuildZoom
+Pet Services:       Rover, Wag, PetFinder, VetFinder
+Education/Tutoring: Wyzant, Tutor.com, Care.com
+General (all):      Google Business Profile, Yelp, Bing Places, Apple Maps, Facebook,
+                    Better Business Bureau, Chamber of Commerce, Foursquare, Nextdoor,
+                    Manta, Superpages, CitySearch, YellowPages
+
+CITATION PRIORITY RULES:
+1. Mark as "critical": Google Business Profile, Yelp, BBB, Bing Places — always top of list
+2. Mark as "high": The 3-5 most authoritative industry-specific directories for this exact vertical
+3. Mark as "medium": Secondary industry directories and local/regional directories in {location}
+4. "category" must be "general", "industry-specific", or "local"
+5. "why_relevant": explain in one sentence why this directory carries domain authority for this business type
+6. Sort citations: critical first, then high, then medium
 
 Return JSON with EXACTLY these keys:
 {{
@@ -632,7 +813,13 @@ Return JSON with EXACTLY these keys:
     "q_and_a": ["Question to seed 1", "Question 2", "Question 3"]
   }},
   "citations": [
-    {{"site": "Site name", "url": "https://...", "priority": "critical|high|medium", "category": "general|industry|local"}}
+    {{
+      "site": "Site name",
+      "url": "https://...",
+      "priority": "critical|high|medium",
+      "category": "general|industry-specific|local",
+      "why_relevant": "One sentence: why this directory has domain authority for THIS specific business type"
+    }}
   ],
   "link_opportunities": [
     {{"name": "Site or org name", "url": "https://...", "link_type": "directory|guest-post|sponsorship|resource", "reason": "Why this is valuable", "outreach_template": "Short outreach message"}}
@@ -647,7 +834,11 @@ Return JSON with EXACTLY these keys:
   "estimated_impact": "Summary of expected impact from these changes"
 }}
 
-Provide at least 8 citations, 5 link opportunities, and 5 blog topics."""
+Requirements:
+- At least 10 citations; minimum 4 must be industry-specific for this exact business type
+- Every citation object MUST include "why_relevant" — never omit this field
+- Citations sorted: critical first, then high, then medium
+- At least 5 link opportunities and 5 blog topics"""
 
 
 @app.post("/agents/local-seo")
@@ -868,7 +1059,7 @@ def calculate_cost_estimate(agents_run: int = 4) -> float:
 
 
 @app.post("/workflow/seo-audit")
-async def seo_audit_workflow(request: AuditRequest):
+async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = Depends(get_current_user)):
     """
     Full SEO Audit — runs keyword research first, then on-page + local + technical concurrently.
     Total time: ~60-90 seconds instead of ~160 sequential.
@@ -914,7 +1105,7 @@ async def seo_audit_workflow(request: AuditRequest):
 
         # Persist to DB — run in thread pool so we don't block the event loop
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed)
+        await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed, current_user.id)
 
         return report
 
@@ -925,12 +1116,13 @@ async def seo_audit_workflow(request: AuditRequest):
         raise HTTPException(500, "Audit failed — please try again")
 
 
-def _save_audit(audit_id: str, request, report: dict, elapsed: float) -> None:
+def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: str = None) -> None:
     """Synchronous DB write — called via run_in_executor."""
     try:
         db = SessionLocal()
         db.add(Audit(
             id=audit_id,
+            user_id=user_id,
             keyword=request.keyword,
             target_url=request.target_url,
             location=request.location,
@@ -952,12 +1144,13 @@ def _save_audit(audit_id: str, request, report: dict, elapsed: float) -> None:
 # =============================================================================
 
 @app.get("/audits")
-def list_audits(limit: int = 20, offset: int = 0):
-    """Return the most recent audits (metadata only, no full results)."""
+def list_audits(limit: int = 20, offset: int = 0, current_user: CurrentUser = Depends(get_current_user)):
+    """Return the authenticated user's audits (metadata only, no full results)."""
     db = SessionLocal()
     try:
         rows = (
             db.query(Audit)
+            .filter(Audit.user_id == current_user.id)
             .order_by(Audit.created_at.desc())
             .offset(offset)
             .limit(min(limit, 100))
@@ -981,16 +1174,50 @@ def list_audits(limit: int = 20, offset: int = 0):
 
 
 @app.get("/audits/{audit_id}")
-def get_audit(audit_id: str):
-    """Return the full result JSON for a single audit."""
+def get_audit(audit_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Return the full result JSON for a single audit (owner only)."""
     db = SessionLocal()
     try:
-        row = db.query(Audit).filter(Audit.id == audit_id).first()
+        row = db.query(Audit).filter(
+            Audit.id == audit_id,
+            Audit.user_id == current_user.id,
+        ).first()
         if not row:
             raise HTTPException(status_code=404, detail="Audit not found")
         return json.loads(row.results_json)
     finally:
         db.close()
+
+
+@app.post("/audits/{audit_id}/export")
+def export_audit_pdf(audit_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Generate and return a PDF report for a completed audit (owner only)."""
+    db = SessionLocal()
+    try:
+        row = db.query(Audit).filter(
+            Audit.id == audit_id,
+            Audit.user_id == current_user.id,
+        ).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Audit not found")
+        audit_data = json.loads(row.results_json)
+    finally:
+        db.close()
+
+    try:
+        pdf_bytes = build_pdf(audit_data)
+    except Exception as e:
+        logger.error(f"PDF generation failed for {audit_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="PDF generation failed")
+
+    slug = audit_data.get("keyword", "audit").replace(" ", "-")[:30]
+    filename = f"seo-audit-{slug}-{audit_id[:8]}.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 # =============================================================================
