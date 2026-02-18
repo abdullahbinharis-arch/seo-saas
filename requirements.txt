@@ -19,6 +19,6 @@ pydantic>=2.5.0
 # Environment
 python-dotenv>=1.0.0
 
-# --- Uncomment when you reach Week 3 (database) ---
-# sqlalchemy>=2.0.23
-# psycopg2-binary>=2.9.9
+# Database
+sqlalchemy>=2.0.23
+psycopg2-binary>=2.9.9

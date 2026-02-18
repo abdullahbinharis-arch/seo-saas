@@ -58,6 +58,12 @@ from anthropic import AsyncAnthropic          # requires anthropic >= 0.39
 anthropic_client = AsyncAnthropic()           # reads ANTHROPIC_API_KEY from env
 
 # ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+from database import Audit, SessionLocal, init_db
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -80,6 +86,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    logger.info("Database tables ready")
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +680,7 @@ async def seo_audit_workflow(request: AuditRequest):
         elapsed = round(time.time() - start, 1)
         logger.info(f"[{audit_id}] Audit completed in {elapsed}s")
 
-        return {
+        report = {
             "audit_id": audit_id,
             "keyword": request.keyword,
             "target_url": request.target_url,
@@ -688,11 +700,85 @@ async def seo_audit_workflow(request: AuditRequest):
             },
         }
 
+        # Persist to DB — run in thread pool so we don't block the event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed)
+
+        return report
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[{audit_id}] Audit failed: {e}", exc_info=True)
         raise HTTPException(500, "Audit failed — please try again")
+
+
+def _save_audit(audit_id: str, request, report: dict, elapsed: float) -> None:
+    """Synchronous DB write — called via run_in_executor."""
+    try:
+        db = SessionLocal()
+        db.add(Audit(
+            id=audit_id,
+            keyword=request.keyword,
+            target_url=request.target_url,
+            location=request.location,
+            status="completed",
+            results_json=json.dumps(report),
+            api_cost=report["summary"]["estimated_api_cost"],
+            execution_time=elapsed,
+        ))
+        db.commit()
+        logger.info(f"[{audit_id}] Saved to database")
+    except Exception as e:
+        logger.error(f"[{audit_id}] DB save failed: {e}")
+    finally:
+        db.close()
+
+
+# =============================================================================
+# Audit history
+# =============================================================================
+
+@app.get("/audits")
+def list_audits(limit: int = 20, offset: int = 0):
+    """Return the most recent audits (metadata only, no full results)."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Audit)
+            .order_by(Audit.created_at.desc())
+            .offset(offset)
+            .limit(min(limit, 100))
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "keyword": r.keyword,
+                "target_url": r.target_url,
+                "location": r.location,
+                "status": r.status,
+                "api_cost": r.api_cost,
+                "execution_time": r.execution_time,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/audits/{audit_id}")
+def get_audit(audit_id: str):
+    """Return the full result JSON for a single audit."""
+    db = SessionLocal()
+    try:
+        row = db.query(Audit).filter(Audit.id == audit_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Audit not found")
+        return json.loads(row.results_json)
+    finally:
+        db.close()
 
 
 # =============================================================================
