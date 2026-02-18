@@ -259,6 +259,87 @@ async def scrape_page(url: str) -> dict:
         return {"url": url, "success": False, "error": str(e)}
 
 
+async def scrape_technical_signals(url: str) -> dict:
+    """Extract technical SEO signals from the raw HTML of a page."""
+    from urllib.parse import urlparse
+
+    signals: dict = {
+        "url": url,
+        "success": False,
+        "https": urlparse(url).scheme == "https",
+        "viewport": None,
+        "canonical": None,
+        "robots_meta": None,
+        "schemas": [],
+        "images_total": 0,
+        "images_missing_alt": [],
+        "render_blocking_scripts": 0,
+        "lazy_loaded_images": 0,
+        "inline_style_bytes": 0,
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=True,
+            headers={"User-Agent": "SEOSaasBot/1.0"},
+        ) as http:
+            resp = await http.get(url)
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        signals["success"] = True
+
+        # Viewport
+        vp = soup.find("meta", attrs={"name": "viewport"})
+        signals["viewport"] = vp.get("content", "") if vp else None
+
+        # Canonical
+        canon = soup.find("link", rel="canonical")
+        signals["canonical"] = canon.get("href", "") if canon else None
+
+        # Robots meta
+        robots = soup.find("meta", attrs={"name": "robots"})
+        signals["robots_meta"] = robots.get("content", "") if robots else None
+
+        # Structured data
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                schema = json.loads(script.string or "{}")
+                schema_type = schema.get("@type") or schema.get("@graph", [{}])[0].get("@type", "Unknown")
+                signals["schemas"].append(schema_type)
+            except (json.JSONDecodeError, IndexError):
+                signals["schemas"].append("Unknown")
+
+        # Images
+        imgs = soup.find_all("img")
+        signals["images_total"] = len(imgs)
+        signals["images_missing_alt"] = [
+            img.get("src", "unknown")[:80]
+            for img in imgs
+            if not img.get("alt")
+        ][:20]  # cap at 20 for prompt brevity
+        signals["lazy_loaded_images"] = sum(
+            1 for img in imgs if img.get("loading") == "lazy"
+        )
+
+        # Render-blocking scripts (in <head>, no defer/async)
+        head = soup.find("head") or soup
+        signals["render_blocking_scripts"] = sum(
+            1 for s in head.find_all("script", src=True)
+            if not s.get("defer") and not s.get("async")
+        )
+
+        # Inline styles size
+        signals["inline_style_bytes"] = sum(
+            len(s.string or "") for s in soup.find_all("style")
+        )
+
+    except Exception as e:
+        logger.warning(f"Technical scrape failed for {url}: {e}")
+
+    return signals
+
+
 async def fetch_competitors(keyword: str, location: str) -> list[dict]:
     """Fetch top organic competitors from SerpApi."""
     if not SERPAPI_KEY:
@@ -608,10 +689,131 @@ async def local_seo_agent(request: AuditRequest):
 
 
 # =============================================================================
-# ORCHESTRATOR — runs all 3 agents, builds combined report
+# AGENT 4 — Technical SEO
 # =============================================================================
 
-def build_quick_wins(kw: dict, op: dict, local: dict) -> list[str]:
+TECHNICAL_SYSTEM = """You are a technical SEO engineer specialising in Core Web Vitals, crawlability, and structured data.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Your findings are specific, evidence-based, and prioritised by SEO impact."""
+
+TECHNICAL_PROMPT = """Perform a technical SEO audit using the signals scraped from this page.
+
+TARGET URL: {target_url}
+TARGET KEYWORD: {keyword}
+
+TECHNICAL SIGNALS:
+- HTTPS: {https}
+- Viewport meta tag: {viewport}
+- Canonical tag: {canonical}
+- Robots meta: {robots_meta}
+- Structured data schemas found: {schemas}
+- Total images: {images_total}
+- Images missing alt text: {images_missing_alt}
+- Lazy-loaded images: {lazy_loaded_images}
+- Render-blocking scripts in <head>: {render_blocking_scripts}
+- Inline CSS bytes: {inline_style_bytes}
+
+Return JSON with EXACTLY these keys:
+{{
+  "technical_score": 0,
+  "https": {{
+    "status": "pass|fail",
+    "detail": "One sentence explanation"
+  }},
+  "mobile": {{
+    "viewport_present": true,
+    "viewport_content": "exact viewport content or null",
+    "status": "pass|fail|warn",
+    "recommendation": "Specific fix or confirmation it is correct"
+  }},
+  "canonical": {{
+    "tag_present": true,
+    "canonical_url": "the canonical href or null",
+    "status": "pass|fail|warn",
+    "recommendation": "Specific fix or confirmation"
+  }},
+  "robots": {{
+    "meta_content": "the robots content or null",
+    "status": "pass|fail|warn",
+    "recommendation": "Specific fix or confirmation"
+  }},
+  "structured_data": {{
+    "schemas_found": ["type1", "type2"],
+    "status": "pass|warn|fail",
+    "schemas_to_add": ["FAQPage", "BreadcrumbList"],
+    "recommendation": "Specific implementation advice"
+  }},
+  "images": {{
+    "total": 0,
+    "missing_alt_count": 0,
+    "lazy_loaded_count": 0,
+    "status": "pass|warn|fail",
+    "recommendation": "Specific fix"
+  }},
+  "page_speed": {{
+    "render_blocking_scripts": 0,
+    "inline_css_bytes": 0,
+    "status": "pass|warn|fail",
+    "issues": ["specific issue 1", "specific issue 2"],
+    "recommendation": "Specific fix"
+  }},
+  "priority_fixes": [
+    "Most impactful fix first (be specific)",
+    "Second fix",
+    "Third fix"
+  ],
+  "quick_wins": [
+    "Fastest technical fix 1",
+    "Fastest technical fix 2"
+  ]
+}}
+
+Score 0–10 (10 = no issues). Base the score on: HTTPS (2pts), viewport (1pt), canonical (1pt), structured data (2pts), images (2pts), page speed (2pts)."""
+
+
+@app.post("/agents/technical-seo")
+async def technical_seo_agent(request: AuditRequest):
+    """Technical SEO Agent — HTTPS, mobile, canonical, schema, images, page speed."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] Technical SEO starting for '{request.target_url}'")
+
+    signals = await scrape_technical_signals(request.target_url)
+
+    prompt = TECHNICAL_PROMPT.format(
+        target_url=request.target_url,
+        keyword=request.keyword,
+        https=signals["https"],
+        viewport=signals["viewport"] or "NOT FOUND",
+        canonical=signals["canonical"] or "NOT FOUND",
+        robots_meta=signals["robots_meta"] or "NOT FOUND",
+        schemas=", ".join(signals["schemas"]) if signals["schemas"] else "None found",
+        images_total=signals["images_total"],
+        images_missing_alt=signals["images_missing_alt"] or "None",
+        lazy_loaded_images=signals["lazy_loaded_images"],
+        render_blocking_scripts=signals["render_blocking_scripts"],
+        inline_style_bytes=signals["inline_style_bytes"],
+    )
+
+    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=2000)
+
+    return {
+        "agent": "technical_seo",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "target_url": request.target_url,
+        "page_scraped": signals["success"],
+        "signals": signals,
+        "recommendations": recommendations,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
+# ORCHESTRATOR — runs all 4 agents, builds combined report
+# =============================================================================
+
+def build_quick_wins(kw: dict, op: dict, local: dict, tech: dict) -> list[str]:
     """Extract real quick wins from each agent's output instead of hardcoding."""
     wins = []
 
@@ -635,7 +837,14 @@ def build_quick_wins(kw: dict, op: dict, local: dict) -> list[str]:
     if isinstance(local_rec, dict):
         local_wins = local_rec.get("quick_wins", [])
         if isinstance(local_wins, list):
-            wins.extend(local_wins[:3])
+            wins.extend(local_wins[:2])
+
+    # From technical SEO
+    tech_rec = tech.get("recommendations", {})
+    if isinstance(tech_rec, dict):
+        tech_wins = tech_rec.get("quick_wins", [])
+        if isinstance(tech_wins, list):
+            wins.extend(tech_wins[:2])
 
     # Fallback if agents didn't return structured data
     if not wins:
@@ -649,7 +858,7 @@ def build_quick_wins(kw: dict, op: dict, local: dict) -> list[str]:
     return wins[:8]
 
 
-def calculate_cost_estimate(agents_run: int = 3) -> float:
+def calculate_cost_estimate(agents_run: int = 4) -> float:
     """Rough cost per audit based on token usage."""
     # ~3K input + ~2K output per agent × 3 agents
     # Sonnet: $3/M input, $15/M output
@@ -661,8 +870,8 @@ def calculate_cost_estimate(agents_run: int = 3) -> float:
 @app.post("/workflow/seo-audit")
 async def seo_audit_workflow(request: AuditRequest):
     """
-    Full SEO Audit — runs keyword research first, then on-page + local concurrently.
-    Total time: ~60-80 seconds instead of ~120 sequential.
+    Full SEO Audit — runs keyword research first, then on-page + local + technical concurrently.
+    Total time: ~60-90 seconds instead of ~160 sequential.
     """
     audit_id = str(uuid.uuid4())
     start = time.time()
@@ -672,10 +881,12 @@ async def seo_audit_workflow(request: AuditRequest):
         # Phase 1 — keyword research (other agents benefit from this data)
         keyword_results = await keyword_research_agent(request)
 
-        # Phase 2 — on-page + local run concurrently (they're independent)
-        on_page_task = on_page_seo_agent(request)
-        local_task = local_seo_agent(request)
-        on_page_results, local_results = await asyncio.gather(on_page_task, local_task)
+        # Phase 2 — on-page, local, and technical run concurrently (all independent)
+        on_page_results, local_results, technical_results = await asyncio.gather(
+            on_page_seo_agent(request),
+            local_seo_agent(request),
+            technical_seo_agent(request),
+        )
 
         elapsed = round(time.time() - start, 1)
         logger.info(f"[{audit_id}] Audit completed in {elapsed}s")
@@ -686,17 +897,18 @@ async def seo_audit_workflow(request: AuditRequest):
             "target_url": request.target_url,
             "location": request.location,
             "status": "completed",
-            "agents_executed": 3,
+            "agents_executed": 4,
             "execution_time_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
             "agents": {
                 "keyword_research": keyword_results,
                 "on_page_seo": on_page_results,
                 "local_seo": local_results,
+                "technical_seo": technical_results,
             },
             "summary": {
                 "estimated_api_cost": calculate_cost_estimate(),
-                "quick_wins": build_quick_wins(keyword_results, on_page_results, local_results),
+                "quick_wins": build_quick_wins(keyword_results, on_page_results, local_results, technical_results),
             },
         }
 
