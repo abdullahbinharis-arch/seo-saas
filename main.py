@@ -431,6 +431,78 @@ async def scrape_page(url: str) -> dict:
         return {"url": url, "success": False, "error": str(e)}
 
 
+async def fetch_pagespeed(url: str) -> dict:
+    """Call Google PageSpeed Insights API (free, no key) for mobile + desktop."""
+    base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+    result = {
+        "mobile": {},
+        "desktop": {},
+        "success": False,
+        "error": None,
+    }
+
+    def _parse_strategy(data: dict) -> dict:
+        cats = data.get("lighthouseResult", {}).get("categories", {})
+        audits = data.get("lighthouseResult", {}).get("audits", {})
+
+        def ms(audit_id: str) -> str | None:
+            a = audits.get(audit_id, {})
+            disp = a.get("displayValue")
+            return disp if disp else None
+
+        def score(audit_id: str) -> float | None:
+            s = audits.get(audit_id, {}).get("score")
+            return round(s * 100) if s is not None else None
+
+        # Top 5 opportunities by estimated savings
+        opportunities = []
+        for audit_id, audit in audits.items():
+            if audit.get("details", {}).get("type") == "opportunity":
+                savings_ms = audit.get("details", {}).get("overallSavingsMs", 0) or 0
+                if savings_ms > 0:
+                    opportunities.append({
+                        "id": audit_id,
+                        "title": audit.get("title", audit_id),
+                        "savings_ms": round(savings_ms),
+                        "description": audit.get("description", "")[:120],
+                    })
+        opportunities.sort(key=lambda x: x["savings_ms"], reverse=True)
+
+        return {
+            "performance_score": round((cats.get("performance", {}).get("score") or 0) * 100),
+            "lcp": ms("largest-contentful-paint"),
+            "inp": ms("interaction-to-next-paint") or ms("total-blocking-time"),
+            "cls": ms("cumulative-layout-shift"),
+            "fcp": ms("first-contentful-paint"),
+            "ttfb": ms("server-response-time"),
+            "opportunities": opportunities[:5],
+        }
+
+    try:
+        psi_key = os.getenv("PAGESPEED_API_KEY")
+        params_base = {"url": url}
+        if psi_key:
+            params_base["key"] = psi_key
+
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            mobile_resp, desktop_resp = await asyncio.gather(
+                http.get(base, params={**params_base, "strategy": "mobile"}),
+                http.get(base, params={**params_base, "strategy": "desktop"}),
+            )
+        if mobile_resp.status_code == 200:
+            result["mobile"] = _parse_strategy(mobile_resp.json())
+        elif mobile_resp.status_code == 429:
+            result["error"] = "quota_exceeded"
+        if desktop_resp.status_code == 200:
+            result["desktop"] = _parse_strategy(desktop_resp.json())
+        result["success"] = bool(result["mobile"] or result["desktop"])
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning(f"PageSpeed fetch failed for {url}: {e}")
+
+    return result
+
+
 async def scrape_technical_signals(url: str) -> dict:
     """Extract technical SEO signals from the raw HTML of a page."""
     from urllib.parse import urlparse
@@ -884,7 +956,23 @@ BUSINESS TYPE: {business_type}
 TARGET URL: {target_url}
 TARGET KEYWORD: {keyword}
 
-TECHNICAL SIGNALS:
+PAGESPEED INSIGHTS (real data from Google):
+Mobile Performance Score: {psi_mobile_score}/100
+Desktop Performance Score: {psi_desktop_score}/100
+Mobile Metrics:
+  - LCP (Largest Contentful Paint): {psi_mobile_lcp}
+  - INP / TBT (Interaction to Next Paint / Total Blocking Time): {psi_mobile_inp}
+  - CLS (Cumulative Layout Shift): {psi_mobile_cls}
+  - FCP (First Contentful Paint): {psi_mobile_fcp}
+  - TTFB (Time to First Byte): {psi_mobile_ttfb}
+Desktop Metrics:
+  - LCP: {psi_desktop_lcp}
+  - FCP: {psi_desktop_fcp}
+  - TTFB: {psi_desktop_ttfb}
+Top PageSpeed Opportunities:
+{psi_opportunities}
+
+TECHNICAL SIGNALS (from page scrape):
 - HTTPS: {https}
 - Viewport meta tag: {viewport}
 - Canonical tag: {canonical}
@@ -899,6 +987,15 @@ TECHNICAL SIGNALS:
 Return JSON with EXACTLY these keys:
 {{
   "technical_score": 0,
+  "core_web_vitals": {{
+    "mobile_performance_score": {psi_mobile_score},
+    "desktop_performance_score": {psi_desktop_score},
+    "lcp": {{"mobile": "{psi_mobile_lcp}", "desktop": "{psi_desktop_lcp}", "status": "pass|warn|fail"}},
+    "cls": {{"mobile": "{psi_mobile_cls}", "status": "pass|warn|fail"}},
+    "fcp": {{"mobile": "{psi_mobile_fcp}", "desktop": "{psi_desktop_fcp}", "status": "pass|warn|fail"}},
+    "ttfb": {{"mobile": "{psi_mobile_ttfb}", "status": "pass|warn|fail"}},
+    "top_opportunities": ["<opportunity 1 with estimated saving>", "<opportunity 2>", "<opportunity 3>"]
+  }},
   "https": {{
     "status": "pass|fail",
     "detail": "One sentence explanation"
@@ -941,7 +1038,7 @@ Return JSON with EXACTLY these keys:
     "recommendation": "Specific fix"
   }},
   "priority_fixes": [
-    "Most impactful fix first (be specific)",
+    "Most impactful fix first (be specific, reference real PSI numbers)",
     "Second fix",
     "Third fix"
   ],
@@ -951,22 +1048,59 @@ Return JSON with EXACTLY these keys:
   ]
 }}
 
-Score 0–10 (10 = no issues). Base the score on: HTTPS (2pts), viewport (1pt), canonical (1pt), structured data (2pts), images (2pts), page speed (2pts)."""
+Score 0–100 (was 0-10, now 0-100). Scoring:
+- HTTPS: 10pts
+- Mobile performance score ≥ 90: 20pts, 50-89: 10pts, <50: 0pts
+- Desktop performance score ≥ 90: 10pts, 50-89: 5pts, <50: 0pts
+- LCP ≤ 2.5s: 15pts, ≤ 4s: 8pts, >4s: 0pts
+- CLS ≤ 0.1: 10pts, ≤ 0.25: 5pts, >0.25: 0pts
+- Viewport meta present: 5pts
+- Canonical tag: 5pts
+- Structured data: 10pts
+- Images (all have alt text): 5pts
+- PageSpeed data unavailable: use scrape signals only and score conservatively."""
 
 
 @app.post("/agents/technical-seo")
 async def technical_seo_agent(request: AuditRequest):
-    """Technical SEO Agent — HTTPS, mobile, canonical, schema, images, page speed."""
+    """Technical SEO Agent — Core Web Vitals (PageSpeed API), HTTPS, mobile, canonical, schema, images."""
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] Technical SEO starting for '{request.target_url}'")
 
-    signals = await scrape_technical_signals(request.target_url)
+    # Fetch PageSpeed data and scrape signals concurrently
+    signals, psi = await asyncio.gather(
+        scrape_technical_signals(request.target_url),
+        fetch_pagespeed(request.target_url),
+    )
+
+    mob = psi.get("mobile", {})
+    desk = psi.get("desktop", {})
+
+    # Format top opportunities as a bullet list
+    opps = mob.get("opportunities") or desk.get("opportunities") or []
+    opp_lines = "\n".join(
+        f"  - {o['title']}: saves ~{o['savings_ms']}ms"
+        for o in opps
+    ) or "  - No opportunity data available"
 
     prompt = TECHNICAL_PROMPT.format(
         business_name=request.business_name or "this business",
         business_type=request.business_type or "local business",
         target_url=request.target_url,
         keyword=request.keyword,
+        # PageSpeed
+        psi_mobile_score=mob.get("performance_score", "N/A"),
+        psi_desktop_score=desk.get("performance_score", "N/A"),
+        psi_mobile_lcp=mob.get("lcp", "N/A"),
+        psi_mobile_inp=mob.get("inp", "N/A"),
+        psi_mobile_cls=mob.get("cls", "N/A"),
+        psi_mobile_fcp=mob.get("fcp", "N/A"),
+        psi_mobile_ttfb=mob.get("ttfb", "N/A"),
+        psi_desktop_lcp=desk.get("lcp", "N/A"),
+        psi_desktop_fcp=desk.get("fcp", "N/A"),
+        psi_desktop_ttfb=desk.get("ttfb", "N/A"),
+        psi_opportunities=opp_lines,
+        # Scrape signals
         https=signals["https"],
         viewport=signals["viewport"] or "NOT FOUND",
         canonical=signals["canonical"] or "NOT FOUND",
@@ -979,7 +1113,7 @@ async def technical_seo_agent(request: AuditRequest):
         inline_style_bytes=signals["inline_style_bytes"],
     )
 
-    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=1500)
+    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=2000)
 
     return {
         "agent": "technical_seo",
@@ -988,6 +1122,8 @@ async def technical_seo_agent(request: AuditRequest):
         "keyword": request.keyword,
         "target_url": request.target_url,
         "page_scraped": signals["success"],
+        "pagespeed_fetched": psi["success"],
+        "pagespeed": psi,
         "signals": signals,
         "recommendations": recommendations,
         "timestamp": datetime.now().isoformat(),
