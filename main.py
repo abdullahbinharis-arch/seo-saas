@@ -135,6 +135,8 @@ class AuditRequest(BaseModel):
     keyword: str
     target_url: str
     location: str = "Toronto, Canada"
+    business_name: Optional[str] = None
+    business_type: Optional[str] = None
     user_id: Optional[str] = None
 
     @field_validator("keyword")
@@ -584,15 +586,21 @@ async def call_claude(
 # AGENT 1 — Keyword Research
 # =============================================================================
 
-KEYWORD_SYSTEM = """You are an expert SEO keyword researcher specialising in local search.
+KEYWORD_SYSTEM = """You are an expert local SEO keyword researcher helping local businesses rank in Google's Map Pack and local organic results.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
-Your analysis is data-driven, specific, and actionable."""
+Focus on local intent: "near me" searches, city + service combinations, and keywords that drive phone calls, walk-ins, and appointment bookings.
+Your analysis is specific to the business type and location provided — never generic."""
 
-KEYWORD_PROMPT = """Analyse keyword opportunities.
+KEYWORD_PROMPT = """Analyse local keyword opportunities for this business.
 
+BUSINESS NAME: {business_name}
+BUSINESS TYPE: {business_type}
 TARGET KEYWORD: {keyword}
 LOCATION: {location}
 TARGET URL: {target_url}
+
+Focus on keywords that a {business_type} in {location} would need to rank for in the Google Map Pack and local organic results.
+Prioritize "near me" searches, emergency/urgent service keywords, and location + service combinations.
 
 COMPETITOR ANALYSIS:
 {competitor_data}
@@ -609,10 +617,10 @@ Return JSON with EXACTLY these keys:
     {{"theme": "...", "keywords": ["...", "..."]}}
   ],
   "content_gap_opportunities": ["topic 1", "topic 2"],
-  "recommendation": "One paragraph summary of the keyword strategy"
+  "recommendation": "One paragraph summary of the local keyword strategy for this {business_type}"
 }}
 
-Provide at least 15 high-intent keywords, 8 long-tail, and 5 competitor gaps."""
+Provide at least 15 high-intent local keywords, 8 long-tail, and 5 competitor gaps. Every keyword must be relevant to a {business_type} in {location}."""
 
 
 @app.post("/agents/keyword-research")
@@ -625,6 +633,8 @@ async def keyword_research_agent(request: AuditRequest):
     competitor_data = await scrape_competitors(competitors)
 
     prompt = KEYWORD_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
         keyword=request.keyword,
         location=request.location,
         target_url=request.target_url,
@@ -648,12 +658,15 @@ async def keyword_research_agent(request: AuditRequest):
 # AGENT 2 — On-Page SEO
 # =============================================================================
 
-ONPAGE_SYSTEM = """You are an expert on-page SEO specialist with deep knowledge of Google ranking factors.
+ONPAGE_SYSTEM = """You are an expert on-page SEO specialist focused on local businesses and Google local ranking factors.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
-Your recommendations are specific, measurable, and prioritised."""
+Your recommendations prioritize local SEO signals: NAP consistency, local keywords in title/H1, LocalBusiness schema, service-area content, and mobile optimization.
+Every recommendation must be actionable, specific, and tailored to the business type provided."""
 
-ONPAGE_PROMPT = """Analyse and optimise this page for the target keyword.
+ONPAGE_PROMPT = """Analyse and optimise this local business page for the target keyword.
 
+BUSINESS NAME: {business_name}
+BUSINESS TYPE: {business_type}
 TARGET KEYWORD: {keyword}
 TARGET URL: {target_url}
 LOCATION: {location}
@@ -713,6 +726,8 @@ async def on_page_seo_agent(request: AuditRequest):
     competitor_data = await scrape_competitors(competitors)
 
     prompt = ONPAGE_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
         keyword=request.keyword,
         target_url=request.target_url,
         location=request.location,
@@ -743,13 +758,15 @@ async def on_page_seo_agent(request: AuditRequest):
 # AGENT 3 — Local SEO
 # =============================================================================
 
-LOCAL_SYSTEM = """You are a local SEO specialist focused on Google Map Pack rankings and local search dominance.
+LOCAL_SYSTEM = """You are a local SEO specialist focused on Google Map Pack rankings, Google Business Profile optimization, and local search dominance for local businesses.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
-Your citation recommendations are ALWAYS industry-specific — you never suggest the same generic list
-regardless of business type. Every citation must be relevant to the exact business vertical."""
+Your recommendations are ALWAYS industry-specific — never generic. Every citation, GBP attribute, and content strategy must be tailored to the exact business type.
+You understand that local SEO success = GBP completeness + NAP consistency + local citations + review velocity + local content signals."""
 
-LOCAL_PROMPT = """Create a local SEO strategy for this business.
+LOCAL_PROMPT = """Create a comprehensive local SEO strategy for this business.
 
+BUSINESS NAME: {business_name}
+BUSINESS TYPE: {business_type}
 TARGET KEYWORD: {keyword}
 LOCATION: {location}
 TARGET URL: {target_url}
@@ -762,10 +779,9 @@ TARGET PAGE INFO:
 TOP COMPETITORS:
 {competitor_names}
 
-STEP 1 — IDENTIFY BUSINESS TYPE:
-Infer the exact business vertical from the keyword and page content
-(e.g. "dentist near me" → dental practice, "personal injury lawyer" → personal injury law firm,
-"hvac repair" → HVAC contractor, "kitchen cabinets" → kitchen cabinet retailer/installer).
+STEP 1 — BUSINESS CONTEXT:
+The business is a {business_type} named {business_name} located in {location}.
+Use this to make every recommendation specific to {business_type} businesses — not generic local SEO advice.
 
 STEP 2 — SELECT INDUSTRY-SPECIFIC CITATIONS:
 Only recommend directories genuinely relevant to this business type.
@@ -800,6 +816,7 @@ CITATION PRIORITY RULES:
 
 Return JSON with EXACTLY these keys:
 {{
+  "local_seo_score": 0,
   "gbp_optimization": {{
     "priority_attributes": ["attribute to complete 1", "attribute 2"],
     "categories": ["Primary category", "Secondary category"],
@@ -838,7 +855,18 @@ Requirements:
 - At least 10 citations; minimum 4 must be industry-specific for this exact business type
 - Every citation object MUST include "why_relevant" — never omit this field
 - Citations sorted: critical first, then high, then medium
-- At least 5 link opportunities and 5 blog topics"""
+- At least 5 link opportunities and 5 blog topics
+
+LOCAL SEO SCORE (0-100): Score how well this {business_type} is currently optimized for local search based on the page data provided.
+Add points for each signal that is present:
++20 if GBP signals are visible (maps embed, "Google reviews" mention, or GBP link on page)
++15 if NAP (Name/Address/Phone) is clearly displayed on the page
++15 if LocalBusiness or relevant schema markup is present
++10 if customer reviews or testimonials appear on the page
++15 if local keywords appear in the title tag or H1
++10 if there is a blog or local content section visible
++15 if the page appears mobile-friendly (viewport meta, clean structure)
+Be conservative — if data is missing or unclear, assume it is not optimized. Most local businesses score 20-60."""
 
 
 @app.post("/agents/local-seo")
@@ -857,6 +885,8 @@ async def local_seo_agent(request: AuditRequest):
     )
 
     prompt = LOCAL_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
         keyword=request.keyword,
         location=request.location,
         target_url=request.target_url,
@@ -883,12 +913,15 @@ async def local_seo_agent(request: AuditRequest):
 # AGENT 4 — Technical SEO
 # =============================================================================
 
-TECHNICAL_SYSTEM = """You are a technical SEO engineer specialising in Core Web Vitals, crawlability, and structured data.
+TECHNICAL_SYSTEM = """You are a technical SEO engineer specialising in Core Web Vitals, crawlability, and structured data for local business websites.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
-Your findings are specific, evidence-based, and prioritised by SEO impact."""
+Your findings are specific, evidence-based, and prioritised by impact on local search rankings.
+Pay special attention to LocalBusiness schema, mobile optimization, and page speed — all critical for Google Map Pack rankings."""
 
-TECHNICAL_PROMPT = """Perform a technical SEO audit using the signals scraped from this page.
+TECHNICAL_PROMPT = """Perform a technical SEO audit for this local business website.
 
+BUSINESS NAME: {business_name}
+BUSINESS TYPE: {business_type}
 TARGET URL: {target_url}
 TARGET KEYWORD: {keyword}
 
@@ -971,6 +1004,8 @@ async def technical_seo_agent(request: AuditRequest):
     signals = await scrape_technical_signals(request.target_url)
 
     prompt = TECHNICAL_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
         target_url=request.target_url,
         keyword=request.keyword,
         https=signals["https"],
@@ -1003,6 +1038,24 @@ async def technical_seo_agent(request: AuditRequest):
 # =============================================================================
 # ORCHESTRATOR — runs all 4 agents, builds combined report
 # =============================================================================
+
+def calculate_local_seo_score(op: dict, local: dict, tech: dict) -> int:
+    """Compute composite Local SEO Score (0-100) from agent outputs."""
+    # On-page SEO: 30% weight (agent returns seo_score 0-100)
+    op_score = op.get("recommendations", {}).get("current_analysis", {}).get("seo_score", 50)
+    op_score = max(0, min(100, int(op_score)))
+
+    # Technical: 20% weight (agent returns technical_score 0-10, scale to 0-100)
+    tech_raw = tech.get("recommendations", {}).get("technical_score", 5)
+    tech_score = max(0, min(10, int(tech_raw))) * 10
+
+    # Local SEO: 50% weight (agent returns local_seo_score 0-100)
+    local_score = local.get("recommendations", {}).get("local_seo_score", 35)
+    local_score = max(0, min(100, int(local_score)))
+
+    combined = int(op_score * 0.30 + tech_score * 0.20 + local_score * 0.50)
+    return min(100, max(0, combined))
+
 
 def build_quick_wins(kw: dict, op: dict, local: dict, tech: dict) -> list[str]:
     """Extract real quick wins from each agent's output instead of hardcoding."""
@@ -1084,6 +1137,8 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
 
         report = {
             "audit_id": audit_id,
+            "business_name": request.business_name or "",
+            "business_type": request.business_type or "other",
             "keyword": request.keyword,
             "target_url": request.target_url,
             "location": request.location,
@@ -1091,6 +1146,7 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
             "agents_executed": 4,
             "execution_time_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
+            "local_seo_score": calculate_local_seo_score(on_page_results, local_results, technical_results),
             "agents": {
                 "keyword_research": keyword_results,
                 "on_page_seo": on_page_results,
