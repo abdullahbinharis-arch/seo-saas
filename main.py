@@ -584,6 +584,46 @@ async def scrape_technical_signals(url: str) -> dict:
     return signals
 
 
+def calculate_keyword_density(text: str, keyword: str) -> dict:
+    """Count keyword occurrences / total words. Returns density info."""
+    if not text or not keyword:
+        return {"occurrences": 0, "total_words": 0, "density_pct": 0.0, "status": "no_data"}
+
+    words = text.lower().split()
+    total_words = len(words)
+    if total_words == 0:
+        return {"occurrences": 0, "total_words": 0, "density_pct": 0.0, "status": "no_data"}
+
+    # Count full keyword phrase occurrences
+    kw_lower = keyword.lower()
+    text_lower = text.lower()
+    occurrences = text_lower.count(kw_lower)
+
+    # Also count individual words if multi-word keyword
+    kw_words = kw_lower.split()
+    word_occurrences = sum(words.count(w) for w in kw_words if len(w) > 3)
+
+    density_pct = round((occurrences / total_words) * 100, 2)
+
+    if density_pct == 0:
+        status = "missing"
+    elif density_pct < 0.5:
+        status = "too_low"
+    elif density_pct <= 2.0:
+        status = "optimal"
+    else:
+        status = "too_high"
+
+    return {
+        "occurrences": occurrences,
+        "word_occurrences": word_occurrences,
+        "total_words": total_words,
+        "density_pct": density_pct,
+        "recommended_range": "1–2%",
+        "status": status,
+    }
+
+
 async def fetch_competitors(keyword: str, location: str) -> list[dict]:
     """Fetch top organic competitors from SerpApi."""
     if not SERPAPI_KEY:
@@ -696,20 +736,47 @@ TARGET KEYWORD: {keyword}
 LOCATION: {location}
 TARGET URL: {target_url}
 
+CLIENT PAGE DATA:
+- Title: {client_title}
+- H1: {client_h1}
+- Word count: {client_word_count}
+- Keyword density (Python-calculated): {keyword_density_pct}% ({keyword_density_status}) — {keyword_occurrences} occurrences in {total_words} words
+- Content preview: {client_content}
+
+COMPETITOR PAGES (Top 3 from SerpApi):
+{competitor_data}
+
 Focus on keywords that a {business_type} in {location} would need to rank for in the Google Map Pack and local organic results.
 Prioritize "near me" searches, emergency/urgent service keywords, and location + service combinations.
-
-COMPETITOR ANALYSIS:
-{competitor_data}
 
 Return JSON with EXACTLY these keys:
 {{
   "primary_keyword": "the main keyword",
+  "keyword_density": {{
+    "current_pct": {keyword_density_pct},
+    "occurrences": {keyword_occurrences},
+    "total_words": {total_words},
+    "status": "{keyword_density_status}",
+    "recommended_range": "1-2%",
+    "assessment": "<one sentence: is this optimal, too low, or over-stuffed? What should they change?>"
+  }},
+  "semantic_keywords": [
+    {{"keyword": "...", "relevance": "why Google expects this term alongside the primary keyword"}}
+  ],
+  "keyword_gap": [
+    {{
+      "keyword": "...",
+      "category": "missing|weak|strong|untapped",
+      "category_explanation": "missing=competitor ranks, client doesn't | weak=client ranks but lower | strong=client outranks | untapped=nobody ranks well",
+      "action": "create new page|optimize existing page|write blog post|protect with updates",
+      "estimated_volume": "low|medium|high",
+      "difficulty": "low|medium|high"
+    }}
+  ],
   "high_intent_keywords": [
     {{"keyword": "...", "intent": "commercial|informational|navigational|transactional", "estimated_monthly_searches": 0, "difficulty": "low|medium|high", "local_modifier": "..."}}
   ],
   "long_tail_keywords": ["phrase 1", "phrase 2"],
-  "competitor_keywords_we_miss": ["keyword 1", "keyword 2"],
   "keyword_clusters": [
     {{"theme": "...", "keywords": ["...", "..."]}}
   ],
@@ -717,17 +784,29 @@ Return JSON with EXACTLY these keys:
   "recommendation": "One paragraph summary of the local keyword strategy for this {business_type}"
 }}
 
-Provide at least 15 high-intent local keywords, 8 long-tail, and 5 competitor gaps. Every keyword must be relevant to a {business_type} in {location}."""
+Rules:
+- semantic_keywords: at least 10 LSI terms Google expects alongside "{keyword}" for a {business_type}
+- keyword_gap: at least 10 keywords, mix of all 4 categories. Base "missing" and "weak" on competitor page content provided above vs client content.
+- high_intent_keywords: at least 15, specific to a {business_type} in {location}
+- long_tail_keywords: at least 8 phrases (3-5 words each)"""
 
 
 @app.post("/agents/keyword-research")
 async def keyword_research_agent(request: AuditRequest):
-    """Keyword Research Agent — competitor gaps, intent mapping, clusters."""
+    """Keyword Research Agent — density, semantic keywords, gap analysis, clusters."""
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] Keyword Research starting for '{request.keyword}'")
 
-    competitors = await fetch_competitors(request.keyword, request.location)
+    # Scrape client page + fetch competitors concurrently
+    page_data, competitors = await asyncio.gather(
+        scrape_page(request.target_url),
+        fetch_competitors(request.keyword, request.location),
+    )
     competitor_data = await scrape_competitors(competitors)
+
+    # Calculate keyword density from scraped page text
+    client_content = page_data.get("content", "")
+    density = calculate_keyword_density(client_content, request.keyword)
 
     prompt = KEYWORD_PROMPT.format(
         business_name=request.business_name or "this business",
@@ -735,10 +814,21 @@ async def keyword_research_agent(request: AuditRequest):
         keyword=request.keyword,
         location=request.location,
         target_url=request.target_url,
+        # Client page
+        client_title=page_data.get("title", "N/A"),
+        client_h1=page_data.get("h1", "N/A"),
+        client_word_count=page_data.get("word_count", 0),
+        client_content=client_content[:800],
+        # Keyword density (Python-calculated)
+        keyword_density_pct=density["density_pct"],
+        keyword_density_status=density["status"],
+        keyword_occurrences=density["occurrences"],
+        total_words=density["total_words"],
+        # Competitors
         competitor_data=competitor_data,
     )
 
-    recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=2000)
+    recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=2500)
 
     return {
         "agent": "keyword_research",
@@ -746,6 +836,7 @@ async def keyword_research_agent(request: AuditRequest):
         "status": "completed",
         "keyword": request.keyword,
         "competitors_analyzed": len(competitors),
+        "keyword_density": density,
         "recommendations": recommendations,
         "timestamp": datetime.now().isoformat(),
     }
