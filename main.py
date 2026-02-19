@@ -85,7 +85,7 @@ app = FastAPI(
 # CORS — open for development, lock down for production
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:5173,https://seo-frontend-six.vercel.app",
+    "http://localhost:3000,http://localhost:5173,https://seo-frontend-six.vercel.app,https://seo-frontend-git-main-abdullas-projects-fb3622cf.vercel.app",
 ).split(",")
 
 app.add_middleware(
