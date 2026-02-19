@@ -1054,29 +1054,38 @@ async def scrape_competitors(competitors: list[dict]) -> str:
 # Claude helper — centralised, with retry
 # ---------------------------------------------------------------------------
 
+# Limit concurrent Claude API calls to avoid bursting through token-per-minute limits.
+# Set to 2 so the workflow runs efficiently without hammering the rate limit.
+_claude_semaphore = asyncio.Semaphore(2)
+
+
 async def call_claude(
     system: str,
     prompt: str,
     max_tokens: int = 2000,
-    retries: int = 2,
+    retries: int = 4,
     return_raw: bool = False,
 ) -> dict | str:
     """
     Call Claude with a system prompt and user prompt.
-    Retries on transient failures.
+    - Limits concurrency to 2 simultaneous calls via semaphore.
+    - On rate-limit (429) errors, waits 65 s before retrying so the
+      per-minute quota window resets fully.
+    - On other transient errors, waits 3 s × attempt number.
     Returns parsed JSON dict by default, or raw text string if return_raw=True.
     """
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            response = await anthropic_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[
-                    {"role": "user", "content": prompt},
-                ],
-            )
+            async with _claude_semaphore:
+                response = await anthropic_client.messages.create(
+                    model=CLAUDE_MODEL,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[
+                        {"role": "user", "content": prompt},
+                    ],
+                )
             raw = response.content[0].text
             if return_raw:
                 return raw
@@ -1084,9 +1093,15 @@ async def call_claude(
 
         except Exception as e:
             last_error = e
-            logger.warning(f"Claude call attempt {attempt} failed: {e}")
+            err_str = str(e)
+            is_rate_limit = "rate_limit" in err_str.lower() or "429" in err_str
+            wait = 65 if is_rate_limit else 3 * attempt
+            logger.warning(
+                f"Claude call attempt {attempt}/{retries} failed "
+                f"({'rate limit — waiting 65 s' if is_rate_limit else f'retrying in {wait} s'}): {e}"
+            )
             if attempt < retries:
-                await asyncio.sleep(2 * attempt)
+                await asyncio.sleep(wait)
 
     logger.error(f"Claude call failed after {retries} attempts: {last_error}")
     return "" if return_raw else {"error": str(last_error)}
