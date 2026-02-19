@@ -897,7 +897,7 @@ async def local_seo_agent(request: AuditRequest):
         competitor_names=competitor_names or "No competitor data available.",
     )
 
-    recommendations = await call_claude(LOCAL_SYSTEM, prompt, max_tokens=3000)
+    recommendations = await call_claude(LOCAL_SYSTEM, prompt, max_tokens=6000)
 
     return {
         "agent": "local_seo",
