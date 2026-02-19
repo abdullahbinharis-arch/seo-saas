@@ -503,6 +503,134 @@ async def fetch_pagespeed(url: str) -> dict:
     return result
 
 
+async def check_broken_links(base_url: str, soup: "BeautifulSoup", limit: int = 20) -> dict:
+    """Check internal links for 4xx/5xx errors. Capped at `limit` links."""
+    from urllib.parse import urlparse, urljoin
+
+    parsed_base = urlparse(base_url)
+    base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+    # Collect unique internal hrefs only
+    seen: set[str] = set()
+    internal_links: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        full = urljoin(base_url, href)
+        parsed = urlparse(full)
+        if parsed.netloc == parsed_base.netloc and full not in seen:
+            seen.add(full)
+            internal_links.append(full)
+        if len(internal_links) >= limit:
+            break
+
+    broken: list[dict] = []
+    if internal_links:
+        try:
+            async with httpx.AsyncClient(
+                timeout=8.0,
+                follow_redirects=True,
+                headers={"User-Agent": "SEOSaasBot/1.0"},
+            ) as http:
+                tasks = [http.head(lnk) for lnk in internal_links]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for lnk, resp in zip(internal_links, responses):
+                if isinstance(resp, Exception):
+                    broken.append({"url": lnk, "status": "error", "detail": str(resp)[:80]})
+                elif resp.status_code in (404, 410, 500, 502, 503):
+                    broken.append({"url": lnk, "status": resp.status_code})
+        except Exception as e:
+            logger.warning(f"Broken link check failed: {e}")
+
+    return {
+        "total_checked": len(internal_links),
+        "broken_count": len(broken),
+        "broken_links": broken[:10],  # cap for prompt
+    }
+
+
+async def check_redirect_chain(url: str) -> dict:
+    """Follow redirects manually and report chain length."""
+    chain: list[str] = [url]
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=False,
+            headers={"User-Agent": "SEOSaasBot/1.0"},
+        ) as http:
+            current = url
+            for _ in range(6):  # max hops we'll follow
+                resp = await http.get(current)
+                if resp.is_redirect:
+                    next_url = resp.headers.get("location", "")
+                    if not next_url or next_url == current:
+                        break
+                    from urllib.parse import urljoin
+                    next_url = urljoin(current, next_url)
+                    chain.append(next_url)
+                    current = next_url
+                else:
+                    break
+    except Exception as e:
+        logger.warning(f"Redirect chain check failed for {url}: {e}")
+
+    hops = len(chain) - 1
+    return {
+        "hops": hops,
+        "chain": chain,
+        "status": "ok" if hops <= 1 else ("warn" if hops == 2 else "fail"),
+    }
+
+
+async def fetch_robots_and_sitemap(base_url: str) -> dict:
+    """Fetch /robots.txt and /sitemap.xml, report existence and key details."""
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    result = {
+        "robots_txt": {"exists": False, "blocks_important": False, "content_preview": None},
+        "sitemap_xml": {"exists": False, "url_count": 0, "sitemap_url": None},
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            follow_redirects=True,
+            headers={"User-Agent": "SEOSaasBot/1.0"},
+        ) as http:
+            robots_resp, sitemap_resp = await asyncio.gather(
+                http.get(f"{origin}/robots.txt"),
+                http.get(f"{origin}/sitemap.xml"),
+                return_exceptions=True,
+            )
+
+        # robots.txt
+        if not isinstance(robots_resp, Exception) and robots_resp.status_code == 200:
+            content = robots_resp.text
+            result["robots_txt"]["exists"] = True
+            result["robots_txt"]["content_preview"] = content[:300]
+            # Check if it blocks /
+            lines_lower = content.lower()
+            result["robots_txt"]["blocks_important"] = (
+                "disallow: /" in lines_lower and "allow: /" not in lines_lower
+            )
+
+        # sitemap.xml
+        if not isinstance(sitemap_resp, Exception) and sitemap_resp.status_code == 200:
+            result["sitemap_xml"]["exists"] = True
+            result["sitemap_xml"]["sitemap_url"] = f"{origin}/sitemap.xml"
+            # Count <loc> entries as a rough URL count
+            result["sitemap_xml"]["url_count"] = sitemap_resp.text.count("<loc>")
+
+    except Exception as e:
+        logger.warning(f"Robots/sitemap fetch failed: {e}")
+
+    return result
+
+
 async def scrape_technical_signals(url: str) -> dict:
     """Extract technical SEO signals from the raw HTML of a page."""
     from urllib.parse import urlparse
@@ -511,18 +639,26 @@ async def scrape_technical_signals(url: str) -> dict:
         "url": url,
         "success": False,
         "https": urlparse(url).scheme == "https",
+        "redirect_chain": {},
         "viewport": None,
         "canonical": None,
         "robots_meta": None,
+        "og_tags": {},
+        "twitter_tags": {},
         "schemas": [],
         "images_total": 0,
         "images_missing_alt": [],
         "render_blocking_scripts": 0,
         "lazy_loaded_images": 0,
         "inline_style_bytes": 0,
+        "html_text_ratio": None,
+        "broken_links": {},
+        "robots_txt": {},
+        "sitemap_xml": {},
     }
 
     try:
+        # Redirect chain + main page fetch run concurrently
         async with httpx.AsyncClient(
             timeout=12.0,
             follow_redirects=True,
@@ -530,8 +666,16 @@ async def scrape_technical_signals(url: str) -> dict:
         ) as http:
             resp = await http.get(url)
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
         signals["success"] = True
+
+        # Run redirect check + robots/sitemap concurrently while parsing HTML
+        redirect_task = check_redirect_chain(url)
+        robots_task = fetch_robots_and_sitemap(url)
+        broken_task = check_broken_links(url, soup, limit=20)
+
+        # --- Parse HTML signals ---
 
         # Viewport
         vp = soup.find("meta", attrs={"name": "viewport"})
@@ -542,8 +686,20 @@ async def scrape_technical_signals(url: str) -> dict:
         signals["canonical"] = canon.get("href", "") if canon else None
 
         # Robots meta
-        robots = soup.find("meta", attrs={"name": "robots"})
-        signals["robots_meta"] = robots.get("content", "") if robots else None
+        robots_meta = soup.find("meta", attrs={"name": "robots"})
+        signals["robots_meta"] = robots_meta.get("content", "") if robots_meta else None
+
+        # OG tags
+        og = {}
+        for tag in soup.find_all("meta", property=lambda p: p and p.startswith("og:")):
+            og[tag.get("property")] = tag.get("content", "")[:100]
+        signals["og_tags"] = og  # e.g. {"og:title": "...", "og:description": "..."}
+
+        # Twitter tags
+        tw = {}
+        for tag in soup.find_all("meta", attrs={"name": lambda n: n and n.startswith("twitter:")}):
+            tw[tag.get("name")] = tag.get("content", "")[:100]
+        signals["twitter_tags"] = tw
 
         # Structured data
         for script in soup.find_all("script", type="application/ld+json"):
@@ -561,7 +717,7 @@ async def scrape_technical_signals(url: str) -> dict:
             img.get("src", "unknown")[:80]
             for img in imgs
             if not img.get("alt")
-        ][:20]  # cap at 20 for prompt brevity
+        ][:20]
         signals["lazy_loaded_images"] = sum(
             1 for img in imgs if img.get("loading") == "lazy"
         )
@@ -577,6 +733,27 @@ async def scrape_technical_signals(url: str) -> dict:
         signals["inline_style_bytes"] = sum(
             len(s.string or "") for s in soup.find_all("style")
         )
+
+        # HTML/text ratio
+        html_bytes = len(html.encode("utf-8"))
+        visible_text = soup.get_text(separator=" ", strip=True)
+        text_bytes = len(visible_text.encode("utf-8"))
+        ratio_pct = round((text_bytes / html_bytes) * 100, 1) if html_bytes else 0
+        signals["html_text_ratio"] = {
+            "html_bytes": html_bytes,
+            "text_bytes": text_bytes,
+            "ratio_pct": ratio_pct,
+            "status": "ok" if ratio_pct >= 10 else "warn",
+        }
+
+        # Await the concurrent tasks
+        redirect_result, robots_result, broken_result = await asyncio.gather(
+            redirect_task, robots_task, broken_task
+        )
+        signals["redirect_chain"] = redirect_result
+        signals["robots_txt"] = robots_result["robots_txt"]
+        signals["sitemap_xml"] = robots_result["sitemap_xml"]
+        signals["broken_links"] = broken_result
 
     except Exception as e:
         logger.warning(f"Technical scrape failed for {url}: {e}")
@@ -1065,15 +1242,22 @@ Top PageSpeed Opportunities:
 
 TECHNICAL SIGNALS (from page scrape):
 - HTTPS: {https}
+- Redirect chain hops: {redirect_hops} (status: {redirect_status}) — chain: {redirect_chain}
 - Viewport meta tag: {viewport}
 - Canonical tag: {canonical}
 - Robots meta: {robots_meta}
+- OG tags present: {og_tags_present} — keys: {og_tag_keys}
+- Twitter/X card tags present: {twitter_tags_present} — keys: {twitter_tag_keys}
 - Structured data schemas found: {schemas}
 - Total images: {images_total}
 - Images missing alt text: {images_missing_alt}
 - Lazy-loaded images: {lazy_loaded_images}
 - Render-blocking scripts in <head>: {render_blocking_scripts}
 - Inline CSS bytes: {inline_style_bytes}
+- HTML/text ratio: {html_ratio_pct}% ({html_ratio_status}) — {html_bytes} HTML bytes, {text_bytes} visible text bytes
+- Broken internal links: {broken_link_count} broken out of {links_checked} checked — {broken_link_urls}
+- robots.txt: exists={robots_txt_exists}, blocks important paths={robots_blocks}
+- sitemap.xml: exists={sitemap_exists}, URL count={sitemap_url_count}
 
 Return JSON with EXACTLY these keys:
 {{
@@ -1090,6 +1274,11 @@ Return JSON with EXACTLY these keys:
   "https": {{
     "status": "pass|fail",
     "detail": "One sentence explanation"
+  }},
+  "redirect_chain": {{
+    "hops": 0,
+    "status": "pass|warn|fail",
+    "recommendation": "Specific fix or confirmation"
   }},
   "mobile": {{
     "viewport_present": true,
@@ -1108,6 +1297,14 @@ Return JSON with EXACTLY these keys:
     "status": "pass|fail|warn",
     "recommendation": "Specific fix or confirmation"
   }},
+  "social_tags": {{
+    "og_present": true,
+    "og_missing": ["og:image", "og:description"],
+    "twitter_present": true,
+    "twitter_missing": ["twitter:card"],
+    "status": "pass|warn|fail",
+    "recommendation": "List exact tags to add"
+  }},
   "structured_data": {{
     "schemas_found": ["type1", "type2"],
     "status": "pass|warn|fail",
@@ -1121,6 +1318,25 @@ Return JSON with EXACTLY these keys:
     "status": "pass|warn|fail",
     "recommendation": "Specific fix"
   }},
+  "html_text_ratio": {{
+    "ratio_pct": 0,
+    "status": "pass|warn",
+    "recommendation": "Specific fix or confirmation"
+  }},
+  "broken_links": {{
+    "broken_count": 0,
+    "status": "pass|warn|fail",
+    "broken_urls": [],
+    "recommendation": "Specific fix or confirmation"
+  }},
+  "crawlability": {{
+    "robots_txt_exists": true,
+    "robots_blocks_important": false,
+    "sitemap_exists": true,
+    "sitemap_url_count": 0,
+    "status": "pass|warn|fail",
+    "recommendation": "Specific fix"
+  }},
   "page_speed": {{
     "render_blocking_scripts": 0,
     "inline_css_bytes": 0,
@@ -1129,27 +1345,34 @@ Return JSON with EXACTLY these keys:
     "recommendation": "Specific fix"
   }},
   "priority_fixes": [
-    "Most impactful fix first (be specific, reference real PSI numbers)",
+    "Most impactful fix first (be specific, reference real data)",
     "Second fix",
-    "Third fix"
+    "Third fix",
+    "Fourth fix",
+    "Fifth fix"
   ],
   "quick_wins": [
-    "Fastest technical fix 1",
-    "Fastest technical fix 2"
+    "Fastest fix 1 (can be done today)",
+    "Fastest fix 2",
+    "Fastest fix 3"
   ]
 }}
 
-Score 0–100 (was 0-10, now 0-100). Scoring:
+Score 0–100. Scoring:
 - HTTPS: 10pts
-- Mobile performance score ≥ 90: 20pts, 50-89: 10pts, <50: 0pts
-- Desktop performance score ≥ 90: 10pts, 50-89: 5pts, <50: 0pts
-- LCP ≤ 2.5s: 15pts, ≤ 4s: 8pts, >4s: 0pts
-- CLS ≤ 0.1: 10pts, ≤ 0.25: 5pts, >0.25: 0pts
-- Viewport meta present: 5pts
-- Canonical tag: 5pts
-- Structured data: 10pts
-- Images (all have alt text): 5pts
-- PageSpeed data unavailable: use scrape signals only and score conservatively."""
+- Mobile performance ≥90: 20pts, 50-89: 10pts, <50: 0pts
+- Desktop performance ≥90: 10pts, 50-89: 5pts, <50: 0pts
+- LCP ≤2.5s: 10pts, ≤4s: 5pts, >4s: 0pts
+- CLS ≤0.1: 5pts, >0.25: 0pts
+- Viewport present: 3pts | Canonical present: 3pts
+- Structured data (LocalBusiness schema): 10pts, other schema: 5pts, none: 0pts
+- All images have alt text: 5pts
+- Robots.txt + sitemap both exist: 5pts
+- No broken links: 5pts
+- OG + Twitter tags: 5pts
+- Redirect chain ≤1 hop: 4pts
+- HTML/text ratio ≥10%: 5pts
+- PageSpeed data unavailable: score conservatively, note data was unavailable."""
 
 
 @app.post("/agents/technical-seo")
@@ -1174,6 +1397,16 @@ async def technical_seo_agent(request: AuditRequest):
         for o in opps
     ) or "  - No opportunity data available"
 
+    # New signal shorthands
+    redir = signals.get("redirect_chain", {})
+    og = signals.get("og_tags", {})
+    tw = signals.get("twitter_tags", {})
+    html_ratio = signals.get("html_text_ratio", {})
+    broken = signals.get("broken_links", {})
+    robots_txt = signals.get("robots_txt", {})
+    sitemap = signals.get("sitemap_xml", {})
+    broken_urls = ", ".join(b["url"] for b in broken.get("broken_links", [])[:5]) or "None"
+
     prompt = TECHNICAL_PROMPT.format(
         business_name=request.business_name or "this business",
         business_type=request.business_type or "local business",
@@ -1191,7 +1424,7 @@ async def technical_seo_agent(request: AuditRequest):
         psi_desktop_fcp=desk.get("fcp", "N/A"),
         psi_desktop_ttfb=desk.get("ttfb", "N/A"),
         psi_opportunities=opp_lines,
-        # Scrape signals
+        # Existing scrape signals
         https=signals["https"],
         viewport=signals["viewport"] or "NOT FOUND",
         canonical=signals["canonical"] or "NOT FOUND",
@@ -1202,6 +1435,25 @@ async def technical_seo_agent(request: AuditRequest):
         lazy_loaded_images=signals["lazy_loaded_images"],
         render_blocking_scripts=signals["render_blocking_scripts"],
         inline_style_bytes=signals["inline_style_bytes"],
+        # New signals
+        redirect_hops=redir.get("hops", "N/A"),
+        redirect_status=redir.get("status", "N/A"),
+        redirect_chain=" → ".join(redir.get("chain", [])) or "N/A",
+        og_tags_present=bool(og),
+        og_tag_keys=", ".join(og.keys()) or "None",
+        twitter_tags_present=bool(tw),
+        twitter_tag_keys=", ".join(tw.keys()) or "None",
+        html_ratio_pct=html_ratio.get("ratio_pct", "N/A"),
+        html_ratio_status=html_ratio.get("status", "N/A"),
+        html_bytes=html_ratio.get("html_bytes", "N/A"),
+        text_bytes=html_ratio.get("text_bytes", "N/A"),
+        broken_link_count=broken.get("broken_count", 0),
+        links_checked=broken.get("total_checked", 0),
+        broken_link_urls=broken_urls,
+        robots_txt_exists=robots_txt.get("exists", False),
+        robots_blocks=robots_txt.get("blocks_important", False),
+        sitemap_exists=sitemap.get("exists", False),
+        sitemap_url_count=sitemap.get("url_count", 0),
     )
 
     recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=2000)
