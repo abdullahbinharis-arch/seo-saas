@@ -788,110 +788,44 @@ You ALWAYS respond with valid JSON only — no markdown, no explanation, no prea
 Your recommendations are ALWAYS industry-specific — never generic. Every citation, GBP attribute, and content strategy must be tailored to the exact business type.
 You understand that local SEO success = GBP completeness + NAP consistency + local citations + review velocity + local content signals."""
 
-LOCAL_PROMPT = """Create a comprehensive local SEO strategy for this business.
+LOCAL_PROMPT = """Create a local SEO strategy for this business. Respond with valid JSON only.
 
-BUSINESS NAME: {business_name}
-BUSINESS TYPE: {business_type}
-TARGET KEYWORD: {keyword}
-LOCATION: {location}
-TARGET URL: {target_url}
+BUSINESS: {business_name} ({business_type}) in {location}
+URL: {target_url}
+KEYWORD: {keyword}
+PAGE: Title={title} | H1={h1}
+COMPETITORS: {competitor_names}
 
-TARGET PAGE INFO:
-- Title: {title}
-- H1: {h1}
-- Content preview: {content}
-
-TOP COMPETITORS:
-{competitor_names}
-
-STEP 1 — BUSINESS CONTEXT:
-The business is a {business_type} named {business_name} located in {location}.
-Use this to make every recommendation specific to {business_type} businesses — not generic local SEO advice.
-
-STEP 2 — SELECT INDUSTRY-SPECIFIC CITATIONS:
-Only recommend directories genuinely relevant to this business type.
-Use this reference list as a guide (not exhaustive):
-
-Medical/Health:     Healthgrades, Zocdoc, WebMD Doctor Finder, Vitals, RateMDs, US News Health, Castle Connolly
-Dental:             1-800-Dentist, Zocdoc, DentalPlans.com, Opencare, Authority Dental
-Legal:              Avvo, FindLaw, Martindale-Hubbell, Justia, Lawyers.com, Super Lawyers, LegalMatch
-Home Services:      HomeAdvisor, Angi, Thumbtack, Houzz, Porch, Networx, ServiceMagic
-Restaurants/Food:   OpenTable, Zomato, TripAdvisor, MenuPages, Allmenus, Foursquare, GrubHub
-Real Estate:        Zillow, Realtor.com, Trulia, Homes.com, Homesnap, LoopNet (commercial)
-Automotive:         CarGurus, AutoTrader, Cars.com, DealerRater, RepairPal (repair shops)
-Beauty/Salon:       StyleSeat, Vagaro, Booksy, Fresha, Salonory
-Fitness/Gym:        Mindbody, ClassPass, WellnessLiving
-Financial/Acctg:    FINRA BrokerCheck, CPAdirectory, NerdWallet, SmartAsset
-Hotels/Hospitality: TripAdvisor, Booking.com, Expedia, Hotels.com
-Contractors:        Houzz, BuildZoom, Porch, GuildQuality
-Home Improvement:   Houzz, Angi, HomeAdvisor, BuildZoom
-Pet Services:       Rover, Wag, PetFinder, VetFinder
-Education/Tutoring: Wyzant, Tutor.com, Care.com
-General (all):      Google Business Profile, Yelp, Bing Places, Apple Maps, Facebook,
-                    Better Business Bureau, Chamber of Commerce, Foursquare, Nextdoor,
-                    Manta, Superpages, CitySearch, YellowPages
-
-CITATION PRIORITY RULES:
-1. Mark as "critical": Google Business Profile, Yelp, BBB, Bing Places — always top of list
-2. Mark as "high": The 3-5 most authoritative industry-specific directories for this exact vertical
-3. Mark as "medium": Secondary industry directories and local/regional directories in {location}
-4. "category" must be "general", "industry-specific", or "local"
-5. "why_relevant": explain in one sentence why this directory carries domain authority for this business type
-6. Sort citations: critical first, then high, then medium
-
-Return JSON with EXACTLY these keys:
+Return this exact JSON structure:
 {{
-  "local_seo_score": 0,
+  "local_seo_score": <0-100 int>,
   "gbp_optimization": {{
-    "priority_attributes": ["attribute to complete 1", "attribute 2"],
-    "categories": ["Primary category", "Secondary category"],
-    "photo_strategy": "Specific photo recommendations with numbers",
-    "post_strategy": "How often to post and what topics",
+    "priority_attributes": ["<3-5 specific GBP attributes to complete for a {business_type}>"],
+    "categories": ["<primary GBP category>", "<secondary>"],
+    "photo_strategy": "<specific photo types and quantities for a {business_type}>",
     "review_strategy": {{
-      "target_reviews_per_month": 0,
-      "review_request_template": "Short template text",
-      "response_template": "Template for replying to reviews"
-    }},
-    "q_and_a": ["Question to seed 1", "Question 2", "Question 3"]
+      "target_reviews_per_month": <int>,
+      "review_request_template": "<one sentence ask>"
+    }}
   }},
   "citations": [
-    {{
-      "site": "Site name",
-      "url": "https://...",
-      "priority": "critical|high|medium",
-      "category": "general|industry-specific|local",
-      "why_relevant": "One sentence: why this directory has domain authority for THIS specific business type"
-    }}
+    {{"site": "<name>", "url": "<url>", "priority": "critical|high|medium", "category": "general|industry-specific|local"}}
   ],
   "link_opportunities": [
-    {{"name": "Site or org name", "url": "https://...", "link_type": "directory|guest-post|sponsorship|resource", "reason": "Why this is valuable", "outreach_template": "Short outreach message"}}
+    {{"name": "<org>", "link_type": "directory|guest-post|sponsorship", "reason": "<why>"}}
   ],
   "local_content_strategy": {{
-    "blog_topics": ["Topic 1", "Topic 2"],
-    "service_area_pages": ["Area 1", "Area 2"],
-    "faq_questions": ["Question 1", "Question 2"]
+    "blog_topics": ["<topic 1>", "<topic 2>", "<topic 3>"],
+    "service_area_pages": ["<area 1>", "<area 2>"]
   }},
-  "nap_checklist": ["Ensure Name/Address/Phone matches on Google", "Check Yelp listing", "Verify Facebook page"],
-  "quick_wins": ["Fastest win 1", "Fastest win 2", "Fastest win 3"],
-  "estimated_impact": "Summary of expected impact from these changes"
+  "quick_wins": ["<win 1>", "<win 2>", "<win 3>", "<win 4>", "<win 5>"],
+  "estimated_impact": "<one sentence>"
 }}
 
-Requirements:
-- Exactly 8 citations total: 4 general/critical + 4 industry-specific. No more than 8.
-- Every citation object MUST include "why_relevant" — never omit this field
-- Citations sorted: critical first, then high, then medium
-- Exactly 3 link opportunities and 5 blog topics. Be concise.
-
-LOCAL SEO SCORE (0-100): Score how well this {business_type} is currently optimized for local search based on the page data provided.
-Add points for each signal that is present:
-+20 if GBP signals are visible (maps embed, "Google reviews" mention, or GBP link on page)
-+15 if NAP (Name/Address/Phone) is clearly displayed on the page
-+15 if LocalBusiness or relevant schema markup is present
-+10 if customer reviews or testimonials appear on the page
-+15 if local keywords appear in the title tag or H1
-+10 if there is a blog or local content section visible
-+15 if the page appears mobile-friendly (viewport meta, clean structure)
-Be conservative — if data is missing or unclear, assume it is not optimized. Most local businesses score 20-60."""
+Rules:
+- local_seo_score: +20 GBP visible, +15 NAP on page, +15 schema markup, +10 reviews on page, +15 local keyword in title/H1, +10 blog/content, +15 mobile-friendly. Conservative — most score 20-60.
+- citations: exactly 8 total. First 4 = critical generals (GBP, Yelp, BBB, Bing Places). Next 4 = top industry-specific directories for {business_type}.
+- All recommendations must be specific to a {business_type} in {location} — never generic."""
 
 
 @app.post("/agents/local-seo")
