@@ -3501,8 +3501,10 @@ async def seo_audit_workflow(request: AuditRequest, current_user: Optional[Curre
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[{audit_id}] Audit failed: {e}", exc_info=True)
-        raise HTTPException(500, "Audit failed — please try again")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"[{audit_id}] Audit failed: {e}\n{tb}")
+        raise HTTPException(500, f"Audit failed: {type(e).__name__}: {e}")
 
 
 def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: str = None) -> None:
