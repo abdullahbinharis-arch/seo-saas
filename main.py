@@ -853,10 +853,10 @@ Return JSON with EXACTLY these keys:
 }}
 
 Requirements:
-- At least 10 citations; minimum 4 must be industry-specific for this exact business type
+- Exactly 8 citations total: 4 general/critical + 4 industry-specific. No more than 8.
 - Every citation object MUST include "why_relevant" — never omit this field
 - Citations sorted: critical first, then high, then medium
-- At least 5 link opportunities and 5 blog topics
+- Exactly 3 link opportunities and 5 blog topics. Be concise.
 
 LOCAL SEO SCORE (0-100): Score how well this {business_type} is currently optimized for local search based on the page data provided.
 Add points for each signal that is present:
@@ -897,7 +897,7 @@ async def local_seo_agent(request: AuditRequest):
         competitor_names=competitor_names or "No competitor data available.",
     )
 
-    recommendations = await call_claude(LOCAL_SYSTEM, prompt, max_tokens=6000)
+    recommendations = await call_claude(LOCAL_SYSTEM, prompt, max_tokens=4096)
 
     return {
         "agent": "local_seo",
