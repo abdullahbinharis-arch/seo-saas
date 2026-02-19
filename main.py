@@ -51,6 +51,8 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "LocalRank <reports@localrank.io>")
+MOZ_ACCESS_ID = os.getenv("MOZ_ACCESS_ID", "")
+MOZ_SECRET_KEY = os.getenv("MOZ_SECRET_KEY", "")
 
 if not ANTHROPIC_API_KEY:
     logger.warning("⚠️  ANTHROPIC_API_KEY is not set — Claude calls will fail")
@@ -430,6 +432,63 @@ async def scrape_page(url: str) -> dict:
     except Exception as e:
         logger.warning(f"Scrape failed for {url}: {e}")
         return {"url": url, "success": False, "error": str(e)}
+
+
+async def fetch_moz_metrics(url: str) -> dict | None:
+    """
+    Fetch DA, PA, backlink count, and referring domains from Moz Links API.
+    Returns None if Moz keys are not set, quota is exhausted, or request fails.
+    When None is returned, the backlink agent falls back to Claude estimation.
+    """
+    if not MOZ_ACCESS_ID or not MOZ_SECRET_KEY:
+        return None
+
+    from urllib.parse import urlparse
+    import base64
+
+    # Normalise to root domain for DA lookup
+    parsed = urlparse(url)
+    root_domain = f"{parsed.scheme}://{parsed.netloc}/"
+
+    try:
+        credentials = base64.b64encode(
+            f"{MOZ_ACCESS_ID}:{MOZ_SECRET_KEY}".encode()
+        ).decode()
+
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.post(
+                "https://lsapi.seomoz.com/v2/url_metrics",
+                headers={
+                    "Authorization": f"Basic {credentials}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "targets": [root_domain],
+                },
+            )
+
+        if resp.status_code == 429:
+            logger.warning("Moz API quota exhausted — falling back to Claude estimation")
+            return None
+        if resp.status_code != 200:
+            logger.warning(f"Moz API returned {resp.status_code} — falling back to Claude estimation")
+            return None
+
+        data = resp.json()
+        result = data.get("results", [{}])[0]
+
+        return {
+            "domain_authority": result.get("domain_authority"),
+            "page_authority": result.get("page_authority"),
+            "spam_score": result.get("spam_score"),
+            "linking_domains": result.get("linking_domains"),
+            "links": result.get("links"),
+            "data_source": "verified",
+        }
+
+    except Exception as e:
+        logger.warning(f"Moz API error for {url}: {e} — falling back to Claude estimation")
+        return None
 
 
 async def fetch_pagespeed(url: str) -> dict:
@@ -1651,6 +1710,178 @@ async def content_rewriter_agent(request: AuditRequest):
 
 
 # =============================================================================
+# AGENT 6 — Backlink Analysis
+# =============================================================================
+
+BACKLINK_SYSTEM = """You are an expert SEO analyst specialising in backlink profiles and domain authority for local businesses.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+When real Moz data is unavailable you estimate domain strength from scraped signals — be conservative and accurate.
+Every metric you return includes a data_source field: "verified" (from Moz API) or "estimated" (Claude analysis)."""
+
+BACKLINK_PROMPT = """Analyse the backlink profile and domain authority for this local business website.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+TARGET URL: {target_url}
+TARGET KEYWORD: {keyword}
+
+CLIENT PAGE SIGNALS (scraped):
+- Title: {client_title}
+- Word count: {client_word_count}
+- Schemas found: {schemas}
+- Outbound links: {outbound_links}
+- HTTPS: {https}
+- Canonical present: {canonical_present}
+
+MOZ DATA (if available):
+{moz_data}
+
+COMPETITOR COMPARISON:
+{competitor_moz_data}
+
+SERP PRESENCE (how often this domain appears in search results):
+{serp_presence}
+
+Estimation methodology when Moz data is unavailable:
+- DA 0-20: new site, thin content, few citations, no major directory presence
+- DA 20-40: established local site, some directories, moderate content depth
+- DA 40-60: strong local presence, many citations, regular content, good schema
+- DA 60-80: authority site, featured snippets, press mentions, industry links
+- High DA signals: appears in top 3 SERP positions, has schema, BBB/Yelp listed, 1000+ words per page
+
+Return JSON with EXACTLY these keys:
+{{
+  "domain_authority": {{
+    "score": <0-100 int>,
+    "data_source": "verified|estimated",
+    "assessment": "<one sentence interpretation for a local business owner>",
+    "vs_competitors_avg": <competitor avg DA int or null>
+  }},
+  "page_authority": {{
+    "score": <0-100 int>,
+    "data_source": "verified|estimated",
+    "assessment": "<one sentence>"
+  }},
+  "backlink_profile": {{
+    "total_backlinks": <int or estimated range string like "50-200">,
+    "referring_domains": <int or estimated range string>,
+    "data_source": "verified|estimated",
+    "quality_assessment": "<description of likely backlink quality for this business type>",
+    "dofollow_estimate_pct": <estimated % of dofollow links>
+  }},
+  "competitor_comparison": [
+    {{
+      "url": "<competitor url>",
+      "da": <int>,
+      "pa": <int>,
+      "data_source": "verified|estimated",
+      "gap": "<how client compares — ahead/behind/similar>"
+    }}
+  ],
+  "link_gap_summary": "<one paragraph: where the client's backlink profile is weak vs competitors>",
+  "top_issues": [
+    "<specific backlink issue 1>",
+    "<specific issue 2>",
+    "<specific issue 3>"
+  ],
+  "quick_wins": [
+    "<fast backlink win 1 — e.g. claim BBB listing>",
+    "<fast win 2>",
+    "<fast win 3>"
+  ]
+}}"""
+
+
+@app.post("/agents/backlink-analysis")
+async def backlink_analysis_agent(request: AuditRequest):
+    """Backlink Analysis — Moz API when available, Claude estimation as fallback."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] Backlink Analysis starting for '{request.target_url}'")
+
+    # Gather: client page scrape + Moz for client + competitors + SERP data concurrently
+    competitors = await fetch_competitors(request.keyword, request.location, num=3)
+
+    client_page_task = scrape_page(request.target_url)
+    client_moz_task = fetch_moz_metrics(request.target_url)
+    comp_moz_tasks = [fetch_moz_metrics(c["url"]) for c in competitors]
+
+    client_page, client_moz, *comp_moz_results = await asyncio.gather(
+        client_page_task,
+        client_moz_task,
+        *comp_moz_tasks,
+    )
+
+    # Format Moz data for the prompt
+    if client_moz:
+        moz_data = (
+            f"DA: {client_moz.get('domain_authority')} | "
+            f"PA: {client_moz.get('page_authority')} | "
+            f"Backlinks: {client_moz.get('links')} | "
+            f"Referring domains: {client_moz.get('linking_domains')} | "
+            f"Spam score: {client_moz.get('spam_score')}"
+        )
+    else:
+        moz_data = "NOT AVAILABLE — Moz keys not set or quota exceeded. Use Claude estimation from page signals."
+
+    # Format competitor Moz data
+    comp_moz_lines = []
+    for comp, moz in zip(competitors, comp_moz_results):
+        if moz:
+            comp_moz_lines.append(
+                f"  {comp['url']}: DA={moz.get('domain_authority')} PA={moz.get('page_authority')} "
+                f"Links={moz.get('links')} RDs={moz.get('linking_domains')} (verified)"
+            )
+        else:
+            comp_moz_lines.append(
+                f"  {comp['url']}: Moz unavailable — estimate from SERP position #{comp['position']} "
+                f"and snippet: {comp.get('snippet', '')[:100]}"
+            )
+
+    competitor_moz_data = "\n".join(comp_moz_lines) or "No competitor data available."
+
+    # SERP presence: use competitor list as proxy (client's position not fetched separately)
+    serp_presence = (
+        f"Client domain appeared in SerpApi results: {'yes' if any(request.target_url.split('/')[2] in c['url'] for c in competitors) else 'not in top 3'}. "
+        f"Top 3 organic competitors: {', '.join(c['url'] for c in competitors[:3])}"
+    )
+
+    # Outbound links from scrape
+    ext_links = client_page.get("external_links_count", 0)
+    int_links = client_page.get("internal_links_count", 0)
+    outbound_summary = f"{int_links} internal, {ext_links} external links"
+
+    prompt = BACKLINK_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
+        location=request.location,
+        target_url=request.target_url,
+        keyword=request.keyword,
+        client_title=client_page.get("title", "N/A"),
+        client_word_count=client_page.get("word_count", 0),
+        schemas="Available via technical agent",
+        outbound_links=outbound_summary,
+        https=str(request.target_url.startswith("https")),
+        canonical_present="Available via technical agent",
+        moz_data=moz_data,
+        competitor_moz_data=competitor_moz_data,
+        serp_presence=serp_presence,
+    )
+
+    recommendations = await call_claude(BACKLINK_SYSTEM, prompt, max_tokens=1500)
+
+    return {
+        "agent": "backlink_analysis",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "target_url": request.target_url,
+        "moz_available": bool(client_moz),
+        "moz_data": client_moz,
+        "recommendations": recommendations,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
 # AGENT 6 — Blog Writer
 # =============================================================================
 
@@ -1986,22 +2217,23 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
         # Phase 1 — keyword research (other agents benefit from this data)
         keyword_results = await keyword_research_agent(request)
 
-        # Phase 2 — all independent agents run concurrently
+        # Phase 2 + 3 — all independent agents run concurrently
         concurrent_tasks = [
             on_page_seo_agent(request),
             local_seo_agent(request),
             technical_seo_agent(request),
             content_rewriter_agent(request),
+            backlink_analysis_agent(request),
         ]
         if request.include_blog:
             concurrent_tasks.append(blog_writer_agent(request))
 
         results = await asyncio.gather(*concurrent_tasks)
-        on_page_results, local_results, technical_results, rewriter_results = results[:4]
-        blog_results = results[4] if request.include_blog else None
+        on_page_results, local_results, technical_results, rewriter_results, backlink_results = results[:5]
+        blog_results = results[5] if request.include_blog else None
 
         elapsed = round(time.time() - start, 1)
-        agents_run = 5 + (1 if request.include_blog else 0)
+        agents_run = 6 + (1 if request.include_blog else 0)
         logger.info(f"[{audit_id}] Audit completed in {elapsed}s ({agents_run} agents)")
 
         agents_dict = {
@@ -2010,6 +2242,7 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
             "local_seo": local_results,
             "technical_seo": technical_results,
             "content_rewriter": rewriter_results,
+            "backlink_analysis": backlink_results,
         }
         if blog_results:
             agents_dict["blog_writer"] = blog_results
@@ -2022,7 +2255,7 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
             "target_url": request.target_url,
             "location": request.location,
             "status": "completed",
-            "agents_executed": agents_run,
+            "agents_executed": agents_run,  # 6 standard + 1 optional blog
             "execution_time_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
             "local_seo_score": calculate_local_seo_score(on_page_results, local_results, technical_results),
