@@ -526,7 +526,7 @@ async def fetch_competitors(keyword: str, location: str) -> list[dict]:
                     "q": keyword,
                     "location": location,
                     "api_key": SERPAPI_KEY,
-                    "num": 5,
+                    "num": 3,
                 },
             )
             resp.raise_for_status()
@@ -549,11 +549,11 @@ async def fetch_competitors(keyword: str, location: str) -> list[dict]:
 
 async def scrape_competitors(competitors: list[dict]) -> str:
     """Scrape top 3 competitor pages and build a summary string for Claude."""
-    tasks = [scrape_page(c["url"]) for c in competitors[:3]]
+    tasks = [scrape_page(c["url"]) for c in competitors[:2]]
     pages = await asyncio.gather(*tasks)
 
     summaries = []
-    for comp, page in zip(competitors[:3], pages):
+    for comp, page in zip(competitors[:2], pages):
         if page.get("success"):
             summaries.append(
                 f"---\n"
@@ -666,7 +666,7 @@ async def keyword_research_agent(request: AuditRequest):
         competitor_data=competitor_data,
     )
 
-    recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=2500)
+    recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=2000)
 
     return {
         "agent": "keyword_research",
@@ -765,7 +765,7 @@ async def on_page_seo_agent(request: AuditRequest):
         competitor_data=competitor_data,
     )
 
-    recommendations = await call_claude(ONPAGE_SYSTEM, prompt, max_tokens=2500)
+    recommendations = await call_claude(ONPAGE_SYSTEM, prompt, max_tokens=2000)
 
     return {
         "agent": "on_page_seo",
@@ -906,7 +906,7 @@ async def local_seo_agent(request: AuditRequest):
 
     competitor_names = "\n".join(
         f"#{c['position']}: {c['title']} — {c['url']}"
-        for c in competitors[:5]
+        for c in competitors[:3]
     )
 
     prompt = LOCAL_PROMPT.format(
@@ -921,7 +921,7 @@ async def local_seo_agent(request: AuditRequest):
         competitor_names=competitor_names or "No competitor data available.",
     )
 
-    recommendations = await call_claude(LOCAL_SYSTEM, prompt, max_tokens=4096)
+    recommendations = await call_claude(LOCAL_SYSTEM, prompt, max_tokens=3000)
 
     return {
         "agent": "local_seo",
@@ -1045,7 +1045,7 @@ async def technical_seo_agent(request: AuditRequest):
         inline_style_bytes=signals["inline_style_bytes"],
     )
 
-    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=2000)
+    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=1500)
 
     return {
         "agent": "technical_seo",
