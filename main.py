@@ -801,8 +801,8 @@ def calculate_keyword_density(text: str, keyword: str) -> dict:
     }
 
 
-async def fetch_competitors(keyword: str, location: str) -> list[dict]:
-    """Fetch top organic competitors from SerpApi."""
+async def fetch_competitors(keyword: str, location: str, num: int = 3) -> list[dict]:
+    """Fetch top organic competitors from SerpApi. num controls how many results to return."""
     if not SERPAPI_KEY:
         logger.error("SERPAPI_KEY not set — returning empty competitors")
         return []
@@ -815,14 +815,14 @@ async def fetch_competitors(keyword: str, location: str) -> list[dict]:
                     "q": keyword,
                     "location": location,
                     "api_key": SERPAPI_KEY,
-                    "num": 3,
+                    "num": min(num, 10),  # one API call regardless of num
                 },
             )
             resp.raise_for_status()
             data = resp.json()
 
         competitors = []
-        for r in data.get("organic_results", [])[:5]:
+        for r in data.get("organic_results", [])[:num]:
             competitors.append({
                 "url": r.get("link", ""),
                 "title": r.get("title", ""),
@@ -867,10 +867,12 @@ async def call_claude(
     prompt: str,
     max_tokens: int = 2000,
     retries: int = 2,
-) -> dict:
+    return_raw: bool = False,
+) -> dict | str:
     """
     Call Claude with a system prompt and user prompt.
-    Retries on transient failures. Returns parsed JSON dict.
+    Retries on transient failures.
+    Returns parsed JSON dict by default, or raw text string if return_raw=True.
     """
     last_error = None
     for attempt in range(1, retries + 1):
@@ -884,6 +886,8 @@ async def call_claude(
                 ],
             )
             raw = response.content[0].text
+            if return_raw:
+                return raw
             return extract_json(raw)
 
         except Exception as e:
@@ -893,7 +897,7 @@ async def call_claude(
                 await asyncio.sleep(2 * attempt)
 
     logger.error(f"Claude call failed after {retries} attempts: {last_error}")
-    return {"error": str(last_error)}
+    return "" if return_raw else {"error": str(last_error)}
 
 
 # =============================================================================
@@ -1474,6 +1478,178 @@ async def technical_seo_agent(request: AuditRequest):
 
 
 # =============================================================================
+# AGENT 5 — Content Rewriter
+# =============================================================================
+
+REWRITER_SYSTEM = """You are an expert SEO content strategist and copywriter specialising in local business websites.
+You reverse-engineer why top-ranking pages rank, then write better content that outranks them.
+Every rewrite is: data-driven from competitor analysis, locally targeted, keyword-optimised at 1-2% density, and written to convert visitors into customers."""
+
+# Call 1: compact JSON — benchmark analysis + SEO template (no long prose)
+REWRITER_ANALYSIS_PROMPT = """Analyse top-ranking competitor pages for this keyword. Respond with valid JSON only.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+TARGET KEYWORD: {keyword}
+CLIENT PAGE: Title={client_title} | H1={client_h1} | Words={client_word_count}
+
+COMPETITOR BENCHMARK ({competitor_count} pages, avg {avg_word_count} words):
+Top headings found: {heading_patterns}
+{competitor_data}
+
+Return this JSON:
+{{
+  "benchmark": {{
+    "avg_competitor_word_count": {avg_word_count},
+    "recommended_word_count": <avg + 200, min 1200>,
+    "content_gaps": ["<topic competitors cover that client page is missing>"],
+    "client_vs_benchmark": "<one paragraph: specific gaps between client and top competitors>"
+  }},
+  "seo_template": {{
+    "title_tag": "<60 chars max, contains '{keyword}', for {business_name}>",
+    "meta_description": "<155 chars max, contains '{keyword}' and a CTA>",
+    "h1": "<H1 that contains '{keyword}' naturally>",
+    "heading_structure": [
+      {{"tag": "H2", "text": "<section heading>"}},
+      {{"tag": "H3", "text": "<sub-heading>"}}
+    ],
+    "target_word_count": 0,
+    "keywords_to_include": ["{keyword}", "<secondary>", "<location modifier>"],
+    "schema_to_implement": "LocalBusiness + FAQPage"
+  }},
+  "internal_links": [
+    {{"anchor_text": "<text>", "target_path": "/slug", "suggested_placement": "<section>"}}
+  ],
+  "quick_wins": ["<immediate fix 1>", "<fix 2>", "<fix 3>"]
+}}"""
+
+# Call 2: plain text — full page rewrite (no JSON wrapper = no truncation risk)
+REWRITER_CONTENT_PROMPT = """Write a complete, SEO-optimised page for a {business_type} targeting the keyword "{keyword}" in {location}.
+
+BRIEF:
+- Business: {business_name}
+- Target keyword: {keyword} (use 8-12 times naturally, ~1-2% density)
+- Location: {location} (mention at least 5 times)
+- Target length: {target_word_count} words minimum
+- Heading structure to follow: {heading_structure}
+- Key topics to cover: {content_gaps}
+
+Write the full page content now. Rules:
+- Output ONLY the article text — no JSON, no preamble, no explanation
+- Use [H2: heading text] and [H3: heading text] markers for all headings
+- End with a 5-question FAQ section: [Q: question] [A: answer]
+- Write naturally for humans first — no keyword stuffing
+- Include a strong call-to-action paragraph near the end"""
+
+
+@app.post("/agents/content-rewriter")
+async def content_rewriter_agent(request: AuditRequest):
+    """Content Rewriter — builds competitor benchmark then generates full page rewrite (2 Claude calls)."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] Content Rewriter starting for '{request.keyword}'")
+
+    # Fetch top 10 competitors + client page concurrently (1 SerpApi call)
+    competitors, page_data = await asyncio.gather(
+        fetch_competitors(request.keyword, request.location, num=10),
+        scrape_page(request.target_url),
+    )
+
+    # Scrape up to 5 competitor pages concurrently
+    top_comps = competitors[:5]
+    comp_pages = await asyncio.gather(*[scrape_page(c["url"]) for c in top_comps])
+
+    # Build benchmark
+    word_counts: list[int] = []
+    all_headings: list[str] = []
+    comp_summaries: list[str] = []
+
+    for comp, page in zip(top_comps, comp_pages):
+        if not page.get("success"):
+            continue
+        wc = page.get("word_count", 0)
+        if wc > 0:
+            word_counts.append(wc)
+        headings = [h["text"] for h in page.get("headings", [])[:8]]
+        all_headings.extend(headings)
+        comp_summaries.append(
+            f"#{comp['position']}: {comp['title']}\n"
+            f"  URL: {comp['url']}\n"
+            f"  Word count: {wc}\n"
+            f"  H1: {page.get('h1', 'N/A')}\n"
+            f"  Headings: {', '.join(headings[:6])}\n"
+            f"  Content preview: {page.get('content', '')[:400]}"
+        )
+
+    avg_wc = round(sum(word_counts) / len(word_counts)) if word_counts else 1200
+    heading_patterns = ", ".join(all_headings[:12]) or "No heading data"
+    comp_data_str = "\n\n".join(comp_summaries) or "No competitor data — write based on business type and location."
+
+    # Call 1: analysis + template (compact JSON, fast)
+    analysis_prompt = REWRITER_ANALYSIS_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
+        location=request.location,
+        keyword=request.keyword,
+        client_title=page_data.get("title", "N/A"),
+        client_h1=page_data.get("h1", "N/A"),
+        client_word_count=page_data.get("word_count", 0),
+        competitor_count=len(comp_summaries),
+        avg_word_count=avg_wc,
+        heading_patterns=heading_patterns,
+        competitor_data=comp_data_str,
+    )
+
+    analysis = await call_claude(REWRITER_SYSTEM, analysis_prompt, max_tokens=1200)
+
+    # Extract template details to inform the content write
+    tmpl = analysis.get("seo_template", {})
+    target_wc = tmpl.get("target_word_count") or (avg_wc + 200)
+    heading_structure = ", ".join(
+        f"{h['tag']}: {h['text']}"
+        for h in (tmpl.get("heading_structure") or [])[:8]
+    ) or "Use logical H2/H3 structure for the business type"
+    content_gaps = "; ".join(
+        (analysis.get("benchmark", {}).get("content_gaps") or [])[:5]
+    ) or "Cover all main services, local expertise, trust signals, and FAQ"
+
+    # Call 2: full page content as plain text (no JSON = no truncation risk)
+    content_prompt = REWRITER_CONTENT_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
+        location=request.location,
+        keyword=request.keyword,
+        target_word_count=max(target_wc, 1200),
+        heading_structure=heading_structure,
+        content_gaps=content_gaps,
+    )
+
+    rewritten_content = await call_claude(
+        REWRITER_SYSTEM, content_prompt, max_tokens=4000, return_raw=True
+    )
+
+    word_count = len(rewritten_content.split()) if rewritten_content else 0
+    logger.info(f"[{audit_id}] Content rewriter done — {word_count} words written")
+
+    return {
+        "agent": "content_rewriter",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "target_url": request.target_url,
+        "competitors_analyzed": len(comp_summaries),
+        "benchmark": {
+            "avg_competitor_word_count": avg_wc,
+            "client_word_count": page_data.get("word_count", 0),
+        },
+        "recommendations": {
+            **analysis,
+            "rewritten_content": rewritten_content,
+            "rewritten_word_count": word_count,
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
 # ORCHESTRATOR — runs all 4 agents, builds combined report
 # =============================================================================
 
@@ -1654,11 +1830,12 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
         # Phase 1 — keyword research (other agents benefit from this data)
         keyword_results = await keyword_research_agent(request)
 
-        # Phase 2 — on-page, local, and technical run concurrently (all independent)
-        on_page_results, local_results, technical_results = await asyncio.gather(
+        # Phase 2 — all independent agents run concurrently
+        on_page_results, local_results, technical_results, rewriter_results = await asyncio.gather(
             on_page_seo_agent(request),
             local_seo_agent(request),
             technical_seo_agent(request),
+            content_rewriter_agent(request),
         )
 
         elapsed = round(time.time() - start, 1)
@@ -1672,7 +1849,7 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
             "target_url": request.target_url,
             "location": request.location,
             "status": "completed",
-            "agents_executed": 4,
+            "agents_executed": 5,
             "execution_time_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
             "local_seo_score": calculate_local_seo_score(on_page_results, local_results, technical_results),
@@ -1681,6 +1858,7 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
                 "on_page_seo": on_page_results,
                 "local_seo": local_results,
                 "technical_seo": technical_results,
+                "content_rewriter": rewriter_results,
             },
             "summary": {
                 "estimated_api_cost": calculate_cost_estimate(),
