@@ -1054,9 +1054,16 @@ async def scrape_competitors(competitors: list[dict]) -> str:
 # Claude helper — centralised, with retry
 # ---------------------------------------------------------------------------
 
-# Limit concurrent Claude API calls to avoid bursting through token-per-minute limits.
-# Set to 2 so the workflow runs efficiently without hammering the rate limit.
-_claude_semaphore = asyncio.Semaphore(2)
+# Lazily-created semaphore — must be initialised inside the running event loop
+# (Python < 3.10 raises if you create asyncio primitives at module level).
+_claude_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_claude_semaphore() -> asyncio.Semaphore:
+    global _claude_semaphore
+    if _claude_semaphore is None:
+        _claude_semaphore = asyncio.Semaphore(2)
+    return _claude_semaphore
 
 
 async def call_claude(
@@ -1074,10 +1081,11 @@ async def call_claude(
     - On other transient errors, waits 3 s × attempt number.
     Returns parsed JSON dict by default, or raw text string if return_raw=True.
     """
+    sem = _get_claude_semaphore()
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            async with _claude_semaphore:
+            async with sem:
                 response = await anthropic_client.messages.create(
                     model=CLAUDE_MODEL,
                     max_tokens=max_tokens,
