@@ -568,10 +568,9 @@ async def call_claude(
                 system=system,
                 messages=[
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "{"},   # force JSON start
                 ],
             )
-            raw = "{" + response.content[0].text
+            raw = response.content[0].text
             return extract_json(raw)
 
         except Exception as e:

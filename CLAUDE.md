@@ -45,7 +45,7 @@ NextAuth.js on frontend stores JWT in session, sends as Authorization: Bearer <t
 2. **All Claude calls go through `call_claude()`** — the centralised helper in main.py. Never call `anthropic_client.messages.create()` directly from endpoints.
 3. **JSON extraction uses `extract_json()`** — never raw regex. This handles markdown fences, preamble text, and unbalanced braces.
 4. **System prompts are separate constants** — defined at module level (e.g., `KEYWORD_SYSTEM`), not inline in functions.
-5. **Prompts use assistant prefill** — `{"role": "assistant", "content": "{"}` to force JSON output.
+5. **No assistant prefill** — `claude-sonnet-4-6` does not support it. Force JSON via the system prompt wording ("respond with valid JSON only") and `extract_json()` handles parsing.
 6. **Environment variables load via python-dotenv** — `load_dotenv()` is called at startup.
 7. **Error messages to users are generic** — never expose stack traces, API keys, or internal details in HTTP responses.
 8. **Rate limiting is enabled** — in-memory, configurable via `RATE_LIMIT_PER_MIN`.
