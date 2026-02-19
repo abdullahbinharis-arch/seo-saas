@@ -3409,7 +3409,19 @@ async def seo_audit_workflow(request: AuditRequest, current_user: Optional[Curre
         if request.include_blog:
             concurrent_tasks.append(blog_writer_agent(request))
 
-        results = await asyncio.gather(*concurrent_tasks)
+        results = await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+
+        # Log any per-agent exceptions so we can diagnose without hiding them
+        agent_names = ["on_page_seo", "local_seo", "technical_seo", "content_rewriter",
+                       "backlink_analysis", "link_building", "ai_seo", "gbp_audit",
+                       "citation_builder", "rank_tracker"]
+        for name, res in zip(agent_names, results[:10]):
+            if isinstance(res, Exception):
+                logger.error(f"[{audit_id}] Agent '{name}' raised: {type(res).__name__}: {res}")
+
+        # Replace any exceptions with empty dicts so the rest of the report still builds
+        results = [r if not isinstance(r, Exception) else {} for r in results]
+
         (
             on_page_results,
             local_results,
