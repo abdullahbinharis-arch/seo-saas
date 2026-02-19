@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import bcrypt as _bcrypt_lib
 from jose import JWTError, jwt as jose_jwt
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -161,7 +161,8 @@ async def rate_limit_middleware(request: Request, call_next):
 
 class AuditRequest(BaseModel):
     keyword: str
-    target_url: str
+    target_url: str = ""
+    domain: Optional[str] = None  # Alternative to target_url — triggers site-wide crawl
     location: str = "Toronto, Canada"
     business_name: Optional[str] = None
     business_type: Optional[str] = None
@@ -178,13 +179,21 @@ class AuditRequest(BaseModel):
             raise ValueError("Keyword must be under 200 characters")
         return v
 
-    @field_validator("target_url")
-    @classmethod
-    def url_valid(cls, v: str) -> str:
-        v = v.strip()
-        if not v.startswith(("http://", "https://")):
-            raise ValueError("URL must start with http:// or https://")
-        return v
+    @model_validator(mode="after")
+    def resolve_url(self) -> "AuditRequest":
+        # Normalise domain → target_url
+        if self.domain:
+            d = self.domain.strip().lower()
+            d = d.removeprefix("http://").removeprefix("https://").rstrip("/")
+            self.domain = d
+            if not self.target_url:
+                self.target_url = f"https://{d}"
+        if not self.target_url:
+            raise ValueError("Either target_url or domain must be provided")
+        self.target_url = self.target_url.strip()
+        if not self.target_url.startswith(("http://", "https://")):
+            raise ValueError("target_url must start with http:// or https://")
+        return self
 
 
 # =============================================================================
@@ -326,10 +335,11 @@ def auth_oauth_sync(body: OAuthSyncRequest):
 # Utility functions
 # =============================================================================
 
-def extract_json(text: str) -> dict:
+def extract_json(text: str) -> dict | list:
     """
     Robustly extract JSON from Claude responses.
     Handles markdown fences, preamble text, and trailing commentary.
+    Returns a dict or list; wraps unparseable text in {"raw_response": text}.
     """
     text = text.strip()
 
@@ -338,22 +348,30 @@ def extract_json(text: str) -> dict:
         text = text.split("\n", 1)[-1]
         text = text.rsplit("```", 1)[0].strip()
 
-    # Try direct parse
+    # Try direct parse (handles both objects and arrays)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Find the outermost balanced braces
-    start = text.find("{")
-    if start == -1:
+    # Find the outermost balanced braces or brackets
+    obj_start = text.find("{")
+    arr_start = text.find("[")
+
+    # Pick whichever opening delimiter appears first
+    if obj_start == -1 and arr_start == -1:
         return {"raw_response": text}
+
+    if arr_start != -1 and (obj_start == -1 or arr_start < obj_start):
+        start, open_c, close_c = arr_start, "[", "]"
+    else:
+        start, open_c, close_c = obj_start, "{", "}"
 
     depth = 0
     for i in range(start, len(text)):
-        if text[i] == "{":
+        if text[i] == open_c:
             depth += 1
-        elif text[i] == "}":
+        elif text[i] == close_c:
             depth -= 1
             if depth == 0:
                 try:
@@ -432,6 +450,103 @@ async def scrape_page(url: str) -> dict:
     except Exception as e:
         logger.warning(f"Scrape failed for {url}: {e}")
         return {"url": url, "success": False, "error": str(e)}
+
+
+def _normalize_url(url: str) -> str:
+    """Lowercase URL, strip fragment and trailing slash — used for crawl deduplication."""
+    from urllib.parse import urlparse, urlunparse
+    p = urlparse(url)
+    path = p.path.rstrip("/") or "/"
+    return urlunparse((p.scheme, p.netloc.lower(), path, "", "", ""))
+
+
+async def crawl_site(start_url: str, max_pages: int = 20) -> list[dict]:
+    """BFS crawl from start_url following internal links up to max_pages.
+
+    Fetches pages in batches of 5 concurrently.
+    Returns list of scrape_page() dicts where success=True.
+    """
+    from urllib.parse import urlparse
+
+    parsed_start = urlparse(start_url)
+    base_netloc = parsed_start.netloc
+    base_scheme = parsed_start.scheme
+
+    visited: set[str] = set()
+    queue: list[str] = [start_url]
+    pages: list[dict] = []
+
+    while queue and len(pages) < max_pages:
+        # Build a batch of up to 5 unvisited URLs
+        batch: list[str] = []
+        while queue and len(batch) < 5:
+            url = queue.pop(0)
+            norm = _normalize_url(url)
+            if norm not in visited:
+                visited.add(norm)
+                batch.append(url)
+
+        if not batch:
+            break
+
+        results = await asyncio.gather(*[scrape_page(u) for u in batch], return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception) or not isinstance(result, dict):
+                continue
+            if not result.get("success"):
+                continue
+            pages.append(result)
+
+            # Discover new internal links
+            for link in result.get("internal_links", []):
+                href = link.get("href", "")
+                if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                    continue
+                if href.startswith("/"):
+                    full_url = f"{base_scheme}://{base_netloc}{href}"
+                elif base_netloc in href:
+                    full_url = href
+                else:
+                    continue
+
+                # Skip non-HTML resources
+                if any(href.endswith(ext) for ext in (".pdf", ".jpg", ".png", ".gif", ".svg", ".zip", ".xml")):
+                    continue
+
+                norm = _normalize_url(full_url)
+                if norm not in visited:
+                    queue.append(full_url)
+
+    logger.info(f"Site crawl complete: {len(pages)} pages from {start_url}")
+    return pages
+
+
+def aggregate_crawl_results(pages: list[dict]) -> dict:
+    """Compute site-wide on-page aggregate stats from crawled pages."""
+    total = len(pages)
+    if not total:
+        return {"pages_crawled": 0}
+
+    missing_title = sum(1 for p in pages if not p.get("title"))
+    missing_meta = sum(1 for p in pages if not p.get("meta_description"))
+    missing_h1 = sum(1 for p in pages if not p.get("h1"))
+    avg_word_count = round(sum(p.get("word_count", 0) for p in pages) / total)
+    thin_pages = [p["url"] for p in pages if p.get("word_count", 0) < 300]
+    coverage_score = round(
+        100 - ((missing_title + missing_meta + missing_h1) / (total * 3)) * 100
+    )
+
+    return {
+        "pages_crawled": total,
+        "missing_title": missing_title,
+        "missing_meta_description": missing_meta,
+        "missing_h1": missing_h1,
+        "avg_word_count": avg_word_count,
+        "thin_content_count": len(thin_pages),
+        "thin_content_pages": thin_pages[:10],
+        "coverage_score": max(0, coverage_score),
+    }
 
 
 async def fetch_moz_metrics(url: str) -> dict | None:
@@ -1142,17 +1257,35 @@ Be specific — write the actual meta title, not a template."""
 
 
 @app.post("/agents/on-page-seo")
-async def on_page_seo_agent(request: AuditRequest):
-    """On-Page SEO Agent — content audit, meta tags, structure, internal links."""
+async def on_page_seo_agent(request: AuditRequest, pre_scraped_pages: list[dict] | None = None):
+    """On-Page SEO Agent — content audit, meta tags, structure, internal links.
+
+    pre_scraped_pages: pass crawled pages (homepage first) to skip re-fetching.
+    """
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] On-Page SEO starting for '{request.target_url}'")
 
-    # Scrape target + competitors concurrently
-    page_task = scrape_page(request.target_url)
-    comp_task = fetch_competitors(request.keyword, request.location)
-    page_data, competitors = await asyncio.gather(page_task, comp_task)
+    if pre_scraped_pages:
+        # Use pre-crawled data; homepage is the first page
+        page_data = pre_scraped_pages[0]
+        competitors = await fetch_competitors(request.keyword, request.location)
+    else:
+        page_task = scrape_page(request.target_url)
+        comp_task = fetch_competitors(request.keyword, request.location)
+        page_data, competitors = await asyncio.gather(page_task, comp_task)
 
     competitor_data = await scrape_competitors(competitors)
+
+    # Build optional extra context from other crawled pages
+    extra_pages_section = ""
+    if pre_scraped_pages and len(pre_scraped_pages) > 1:
+        lines = ["\nOTHER SITE PAGES (crawled — top service pages by word count):"]
+        for p in pre_scraped_pages[1:4]:
+            lines.append(
+                f"- {p['url']} | Title: {p.get('title','—')} | H1: {p.get('h1','—')} "
+                f"| Words: {p.get('word_count', 0)}"
+            )
+        extra_pages_section = "\n".join(lines)
 
     prompt = ONPAGE_PROMPT.format(
         business_name=request.business_name or "this business",
@@ -1167,7 +1300,7 @@ async def on_page_seo_agent(request: AuditRequest):
         headings=json.dumps(page_data.get("headings", [])[:15]),
         content=page_data.get("content", "")[:2000],
         competitor_data=competitor_data,
-    )
+    ) + extra_pages_section
 
     recommendations = await call_claude(ONPAGE_SYSTEM, prompt, max_tokens=2000)
 
@@ -1440,8 +1573,11 @@ Score 0–100. Scoring:
 
 
 @app.post("/agents/technical-seo")
-async def technical_seo_agent(request: AuditRequest):
-    """Technical SEO Agent — Core Web Vitals (PageSpeed API), HTTPS, mobile, canonical, schema, images."""
+async def technical_seo_agent(request: AuditRequest, crawl_aggregate: dict | None = None):
+    """Technical SEO Agent — Core Web Vitals (PageSpeed API), HTTPS, mobile, canonical, schema, images.
+
+    crawl_aggregate: pass aggregate_crawl_results() output to include site-wide stats in the analysis.
+    """
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] Technical SEO starting for '{request.target_url}'")
 
@@ -1520,6 +1656,23 @@ async def technical_seo_agent(request: AuditRequest):
         sitemap_url_count=sitemap.get("url_count", 0),
     )
 
+    # Append site-wide crawl summary when available
+    if crawl_aggregate and crawl_aggregate.get("pages_crawled", 0) > 1:
+        agg = crawl_aggregate
+        thin_list = ", ".join(agg.get("thin_content_pages", [])[:5]) or "None"
+        prompt += f"""
+
+SITE-WIDE CRAWL DATA ({agg['pages_crawled']} pages crawled):
+- Pages missing title tag: {agg['missing_title']}
+- Pages missing meta description: {agg['missing_meta_description']}
+- Pages missing H1: {agg['missing_h1']}
+- Average word count across site: {agg['avg_word_count']}
+- Thin content pages (<300 words): {agg['thin_content_count']}
+- Thin page URLs: {thin_list}
+- Site coverage score (meta completeness): {agg['coverage_score']}/100
+
+Factor these site-wide issues into your priority_actions — e.g. if 8/20 pages are missing meta descriptions, that's a site-wide fix."""
+
     recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=2000)
 
     return {
@@ -1532,6 +1685,7 @@ async def technical_seo_agent(request: AuditRequest):
         "pagespeed_fetched": psi["success"],
         "pagespeed": psi,
         "signals": signals,
+        "crawl_aggregate": crawl_aggregate or {},
         "recommendations": recommendations,
         "timestamp": datetime.now().isoformat(),
     }
@@ -1882,7 +2036,485 @@ async def backlink_analysis_agent(request: AuditRequest):
 
 
 # =============================================================================
-# AGENT 6 — Blog Writer
+# AGENT 7 — Link Building Strategy
+# =============================================================================
+
+LINKBUILDING_SYSTEM = """You are an expert local SEO link building strategist for small and medium local businesses.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+You prioritise high-probability wins over ambitious targets: easy directory submissions before guest posts."""
+
+# Call 1: compact opportunity list — no email bodies, fits in ~1500 tokens
+LINKBUILDING_OPPS_PROMPT = """Generate a prioritised link building strategy for this local business. Respond with valid JSON only.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+TARGET URL: {target_url}
+TARGET KEYWORD: {keyword}
+DOMAIN AUTHORITY ESTIMATE: {da_estimate} (data_source: {da_source})
+
+TOP ORGANIC COMPETITORS:
+{competitor_data}
+
+Return JSON with EXACTLY this structure (no outreach_template fields yet — those come separately):
+{{
+  "quick_wins": [
+    {{"name": "<directory name>", "url": "<registration URL>", "link_type": "directory|citation|profile", "difficulty": "easy", "expected_da": <int>, "reason": "<why this link matters for a {business_type}>"}}
+  ],
+  "guest_posting": [
+    {{"name": "<publication name>", "url": "<site URL>", "link_type": "guest-post", "difficulty": "medium|hard", "expected_da": <int>, "topic_idea": "<specific article title>", "contact_method": "email|contact-form|social"}}
+  ],
+  "resource_pages": [
+    {{"name": "<org name>", "url": "<resource page URL>", "link_type": "resource", "difficulty": "medium", "expected_da": <int>, "reason": "<why {business_name} belongs here>"}}
+  ],
+  "local_opportunities": [
+    {{"name": "<local org or outlet>", "url": "<URL>", "link_type": "local|sponsorship|press", "difficulty": "easy|medium", "expected_da": <int>, "opportunity_type": "chamber|news|sponsorship|community|event", "reason": "<specific local angle in {location}>"}}
+  ],
+  "competitor_gaps": [
+    {{"name": "<site linking to competitors>", "url": "<linking page URL>", "competitor_linked": "<competitor URL>", "link_type": "competitor-gap", "difficulty": "medium", "expected_da": <int>, "angle": "<why {business_name} deserves a link too>"}}
+  ],
+  "summary": {{
+    "total_opportunities": <int>,
+    "estimated_da_gain_3mo": "<realistic DA improvement in 3 months>",
+    "priority_order": ["<category 1>", "<category 2>", "<category 3>", "<category 4>", "<category 5>"],
+    "monthly_link_target": <int>
+  }}
+}}
+
+Rules:
+- quick_wins: 4 real directories a {business_type} should be on (Google Business Profile, Yelp, BBB, industry-specific)
+- guest_posting: 3 real publications covering {business_type} topics or {location} local news
+- resource_pages: 3 pages (local government, community resource lists, industry associations)
+- local_opportunities: 4 (chamber of commerce, local newspaper, sponsor, neighbourhood group in {location})
+- competitor_gaps: 3 (infer from competitor URLs what sites likely link to them)"""
+
+# Call 2: outreach email templates for all opportunities
+LINKBUILDING_TEMPLATES_PROMPT = """Write ready-to-send outreach email templates for these link building opportunities. Respond with valid JSON only.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+WEBSITE: {target_url}
+
+OPPORTUNITIES (numbered — return templates in the SAME ORDER, one per item):
+{opportunities_list}
+
+Return JSON as an object with a "templates" array — one entry per opportunity, same order:
+{{
+  "templates": [
+    {{
+      "n": 1,
+      "outreach_template": {{
+        "subject": "<specific subject line for opportunity 1>",
+        "body": "<2-3 paragraphs, 60-80 words. Uses {business_name} and mentions their org/site by name. Ends with {target_url}.>"
+      }}
+    }}
+  ]
+}}
+
+Rules:
+- Return exactly {count} templates, numbered 1 to {count} in the same order as the list above
+- Use {business_name} and {target_url} in every template — no generic placeholders
+- Every subject line is specific to that opportunity (not generic "Link request")
+- Body is professional, concise, and ready to send with zero editing
+- For directories/citations: focus on getting listed
+- For guest posts: pitch the specific article idea from the opportunity
+- For local organisations: emphasise the local community angle in {location}"""
+
+
+@app.post("/agents/link-building")
+async def link_building_agent(request: AuditRequest):
+    """Link Building Strategy — 5 categories, full outreach templates, ready to send."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] Link Building starting for '{request.target_url}'")
+
+    # Fetch competitors + client page concurrently
+    competitors, page_data = await asyncio.gather(
+        fetch_competitors(request.keyword, request.location, num=5),
+        scrape_page(request.target_url),
+    )
+
+    # Build competitor summary for context
+    comp_lines = []
+    for c in competitors[:5]:
+        comp_lines.append(
+            f"  #{c['position']}: {c['title']}\n"
+            f"    URL: {c['url']}\n"
+            f"    Snippet: {c.get('snippet', '')[:120]}"
+        )
+    competitor_data = "\n".join(comp_lines) or "No competitor data — generate recommendations based on business type and location."
+
+    # Try to get DA estimate from Moz; fall back to a rough heuristic
+    moz = await fetch_moz_metrics(request.target_url)
+    if moz:
+        da_estimate = moz.get("domain_authority", 30)
+        da_source = "verified"
+    else:
+        wc = page_data.get("word_count", 0)
+        da_estimate = 35 if wc > 800 else 20
+        da_source = "estimated"
+
+    biz_name = request.business_name or "this business"
+    biz_type = request.business_type or "local business"
+
+    # ── Call 1: compact opportunity list (no email bodies) ────────────────────
+    opps_prompt = LINKBUILDING_OPPS_PROMPT.format(
+        business_name=biz_name,
+        business_type=biz_type,
+        location=request.location,
+        target_url=request.target_url,
+        keyword=request.keyword,
+        da_estimate=da_estimate,
+        da_source=da_source,
+        competitor_data=competitor_data,
+    )
+    recommendations = await call_claude(LINKBUILDING_SYSTEM, opps_prompt, max_tokens=1800)
+
+    # ── Call 2: outreach templates for every opportunity ──────────────────────
+    cats = ["quick_wins", "guest_posting", "resource_pages", "local_opportunities", "competitor_gaps"]
+
+    # Build flat ordered list: (cat, item_ref) so we can match back by index
+    all_opps_flat: list[tuple[str, dict]] = []
+    numbered_lines: list[str] = []
+    for cat in cats:
+        for item in recommendations.get(cat, []):
+            if isinstance(item, dict):
+                n = len(all_opps_flat) + 1
+                numbered_lines.append(
+                    f"{n}. [{cat}] {item.get('name', 'Unknown')} — {item.get('url', '')}"
+                )
+                all_opps_flat.append((cat, item))
+
+    if all_opps_flat:
+        templates_prompt = LINKBUILDING_TEMPLATES_PROMPT.format(
+            business_name=biz_name,
+            business_type=biz_type,
+            location=request.location,
+            target_url=request.target_url,
+            opportunities_list="\n".join(numbered_lines),
+            count=len(all_opps_flat),
+        )
+        templates_raw = await call_claude(LINKBUILDING_SYSTEM, templates_prompt, max_tokens=3000)
+
+        # Extract the templates array — may be under "templates" key or be a bare list
+        if isinstance(templates_raw, list):
+            templates_list = templates_raw
+        elif isinstance(templates_raw, dict):
+            templates_list = templates_raw.get("templates", [])
+            if not templates_list:
+                # fall back: first list value
+                templates_list = next(
+                    (v for v in templates_raw.values() if isinstance(v, list)), []
+                )
+        else:
+            templates_list = []
+
+        # Attach by position (index-based — immune to name mismatch)
+        for idx, (_cat, item) in enumerate(all_opps_flat):
+            if idx < len(templates_list):
+                t = templates_list[idx]
+                if isinstance(t, dict):
+                    item["outreach_template"] = t.get("outreach_template", {})
+
+    # Count total opportunities
+    total = sum(len(recommendations.get(c, [])) for c in cats if isinstance(recommendations.get(c), list))
+
+    return {
+        "agent": "link_building",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "target_url": request.target_url,
+        "total_opportunities": total,
+        "recommendations": recommendations,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
+# AGENT 6 — AI SEO Visibility
+# =============================================================================
+
+AISEO_SYSTEM = """You are an expert in Answer Engine Optimisation (AEO) — how local businesses appear in AI-generated answers from ChatGPT, Perplexity, Claude, and Google AI Overviews.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Your recommendations are specific and implementable: exact schema templates, exact FAQ copy, exact E-E-A-T improvements."""
+
+AISEO_PROMPT = """Analyse this local business's AI search visibility and return a complete AEO strategy. Respond with valid JSON only.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+WEBSITE: {target_url}
+KEYWORD: {keyword}
+
+=== SCHEMA MARKUP FOUND ON PAGE ===
+Types present: {schema_types_found}
+Types missing (common for this business type): {schema_types_missing}
+FAQPage schema present: {has_faq_schema}
+
+=== E-E-A-T SIGNALS ===
+Author bio visible: {has_author_bio}
+Professional credentials visible: {has_credentials}
+Reviews/testimonials on page: {reviews_on_page}
+About page linked: {has_about_page}
+Word count: {word_count}
+
+=== PEOPLE ALSO ASK (from Google) ===
+{paa_questions}
+
+=== TOP COMPETITORS (who outrank this business) ===
+{competitor_data}
+
+Return JSON with this exact structure:
+{{
+  "ai_visibility_score": <int 0-100>,
+  "score_breakdown": {{
+    "schema_markup": <int 0-25, points for JSON-LD schemas>,
+    "faq_content": <int 0-20, points for FAQ/Q&A optimisation>,
+    "eeat_signals": <int 0-25, points for author, credentials, reviews>,
+    "content_depth": <int 0-20, points for word count and topical authority>,
+    "local_signals": <int 0-10, points for location mentions, NAP consistency>
+  }},
+  "ai_mention_likelihood": "low|medium|high",
+  "ai_answer_preview": "<2-3 sentence simulation of what an AI assistant would say if asked about this business type in {location}. Write it as if the AI is responding to a user query.>",
+  "current_gaps": [
+    "<specific gap 1 — why AI tools currently overlook this business>",
+    "<specific gap 2>",
+    "<specific gap 3>"
+  ],
+  "priority_actions": [
+    {{
+      "action": "<specific action>",
+      "impact": "high|medium|low",
+      "effort": "easy|medium|hard",
+      "why": "<why this helps AI tools surface the business>",
+      "how": "<specific implementation steps>"
+    }}
+  ],
+  "schema_templates": [
+    {{
+      "type": "<schema type e.g. FAQPage, LocalBusiness, Review>",
+      "priority": "high|medium|low",
+      "description": "<what this schema does for AI visibility>",
+      "json_ld": "<complete valid JSON-LD string, escaped for JSON, ready to paste into a <script> tag>"
+    }}
+  ],
+  "faq_content": [
+    {{
+      "question": "<natural language question a customer would ask>",
+      "answer": "<direct 2-3 sentence answer mentioning {business_name} and {location}. Written to be featured in AI answers.>",
+      "ai_intent": "service-discovery|comparison|how-to|location|pricing"
+    }}
+  ],
+  "summary": {{
+    "top_priority": "<the single most impactful thing to do this week>",
+    "estimated_score_after_fixes": <realistic score after implementing all actions>,
+    "time_to_implement": "<realistic estimate e.g. 2-3 hours>"
+  }}
+}}
+
+Rules:
+- ai_visibility_score: score honestly based on signals above (most local SMBs score 20-50)
+- priority_actions: exactly 5 actions, ordered by impact descending
+- schema_templates: provide 2-3 schemas most critical for {business_type} (always include FAQPage if missing)
+- json_ld in schema_templates must be valid JSON string with {business_name} and {target_url} populated
+- faq_content: exactly 8 Q&As targeting the PAA questions above plus common {business_type} questions
+- Every answer in faq_content mentions {location} at least once"""
+
+
+def _extract_schema_and_eeat(soup) -> dict:
+    """Extract JSON-LD schema types and E-E-A-T signals from a BeautifulSoup page."""
+    import re as _re
+
+    # Schema types from JSON-LD
+    schema_types: list[str] = []
+    has_faq_schema = False
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            raw = tag.string or ""
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                t = obj.get("@type", "")
+                if isinstance(t, list):
+                    schema_types.extend(t)
+                elif t:
+                    schema_types.append(t)
+                if "FAQPage" in str(t):
+                    has_faq_schema = True
+            elif isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, dict):
+                        t = item.get("@type", "")
+                        if t:
+                            schema_types.append(t if isinstance(t, str) else str(t))
+                        if "FAQPage" in str(t):
+                            has_faq_schema = True
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # FAQ content on page (non-schema)
+    faq_count = len(soup.find_all("details")) + len(
+        soup.find_all(class_=_re.compile(r"faq|accordion|question", _re.I))
+    )
+
+    # E-E-A-T signals
+    text_lower = (soup.get_text() or "").lower()
+    has_author_bio = any(w in text_lower for w in ["author", "written by", "about the author"])
+    has_credentials = any(
+        c in text_lower
+        for c in ["dds", "dmd", "bds", "md ", "phd", "rdn", "certified", "licensed", "dr.", "dr "]
+    )
+    reviews_on_page = (
+        text_lower.count("★") + text_lower.count("⭐") > 0
+        or bool(soup.find_all(attrs={"itemprop": "review"}))
+        or bool(soup.find_all(attrs={"itemprop": "ratingValue"}))
+        or "testimonial" in text_lower
+    )
+    has_about_page = bool(soup.find("a", href=_re.compile(r"about", _re.I)))
+
+    return {
+        "schema_types_found": schema_types,
+        "has_faq_schema": has_faq_schema,
+        "faq_count": faq_count,
+        "has_author_bio": has_author_bio,
+        "has_credentials": has_credentials,
+        "reviews_on_page": reviews_on_page,
+        "has_about_page": has_about_page,
+    }
+
+
+async def _fetch_paa(keyword: str, location: str) -> list[dict]:
+    """Fetch People Also Ask questions from SerpAPI (1 credit)."""
+    if not SERPAPI_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "google",
+                    "q": keyword,
+                    "location": location,
+                    "num": "10",
+                    "api_key": SERPAPI_KEY,
+                },
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            questions = []
+            for item in data.get("related_questions", [])[:8]:
+                questions.append({
+                    "question": item.get("question", ""),
+                    "snippet": item.get("snippet", "")[:200],
+                })
+            return questions
+    except Exception:
+        return []
+
+
+async def _scrape_for_ai_seo(url: str) -> dict:
+    """Fetch page HTML and extract schema + E-E-A-T signals for AI SEO analysis."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=True,
+            headers={"User-Agent": "SEOSaasBot/1.0"},
+        ) as http:
+            resp = await http.get(url)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        signals = _extract_schema_and_eeat(soup)
+        text = soup.get_text(separator=" ", strip=True)
+        signals["word_count"] = len(text.split())
+        return signals
+    except Exception:
+        return {
+            "schema_types_found": [],
+            "has_faq_schema": False,
+            "faq_count": 0,
+            "has_author_bio": False,
+            "has_credentials": False,
+            "reviews_on_page": False,
+            "has_about_page": False,
+            "word_count": 0,
+        }
+
+
+@app.post("/agents/ai-seo")
+async def ai_seo_agent(request: AuditRequest):
+    """AI SEO Visibility — schema gaps, E-E-A-T signals, PAA optimisation, AEO action plan."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] AI SEO starting for '{request.target_url}'")
+
+    biz_name = request.business_name or "this business"
+    biz_type = request.business_type or "local business"
+
+    # Run all data collection concurrently (no redundant sequential waits)
+    soup_signals, competitors, paa_questions = await asyncio.gather(
+        _scrape_for_ai_seo(request.target_url),
+        fetch_competitors(request.keyword, request.location, num=5),
+        _fetch_paa(request.keyword, request.location),
+    )
+
+    # Common schema types for this business type that are often missing
+    COMMON_SCHEMAS = {
+        "dental": ["Dentist", "LocalBusiness", "FAQPage", "Review", "BreadcrumbList", "MedicalOrganization"],
+        "restaurant": ["Restaurant", "LocalBusiness", "FAQPage", "Menu", "Review", "BreadcrumbList"],
+        "contractor": ["HomeAndConstructionBusiness", "LocalBusiness", "FAQPage", "Review", "BreadcrumbList"],
+        "lawyer": ["LegalService", "LocalBusiness", "FAQPage", "Review", "BreadcrumbList"],
+        "default": ["LocalBusiness", "FAQPage", "Review", "BreadcrumbList", "WebSite"],
+    }
+    biz_key = next(
+        (k for k in COMMON_SCHEMAS if k in biz_type.lower()), "default"
+    )
+    expected = COMMON_SCHEMAS[biz_key]
+    found = soup_signals.get("schema_types_found", [])
+    missing = [s for s in expected if s not in found]
+
+    # Build competitor summary
+    comp_lines = []
+    for c in competitors[:5]:
+        comp_lines.append(f"  #{c['position']}: {c['title']} — {c['url']}")
+    competitor_data = "\n".join(comp_lines) or "No competitor data available."
+
+    # Format PAA questions
+    paa_str = "\n".join(
+        f"  Q: {q['question']}\n  A: {q.get('snippet', 'No snippet')}" for q in paa_questions
+    ) or "No PAA data — infer common questions from business type."
+
+    prompt = AISEO_PROMPT.format(
+        business_name=biz_name,
+        business_type=biz_type,
+        location=request.location,
+        target_url=request.target_url,
+        keyword=request.keyword,
+        schema_types_found=", ".join(found) if found else "None detected",
+        schema_types_missing=", ".join(missing) if missing else "None — good coverage",
+        has_faq_schema=soup_signals.get("has_faq_schema", False),
+        has_author_bio=soup_signals.get("has_author_bio", False),
+        has_credentials=soup_signals.get("has_credentials", False),
+        reviews_on_page=soup_signals.get("reviews_on_page", False),
+        has_about_page=soup_signals.get("has_about_page", False),
+        word_count=soup_signals.get("word_count", 0),
+        paa_questions=paa_str,
+        competitor_data=competitor_data,
+    )
+
+    analysis = await call_claude(AISEO_SYSTEM, prompt, max_tokens=2800)
+
+    return {
+        "agent": "ai_seo",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "target_url": request.target_url,
+        "signals_collected": {
+            "schema_types_found": found,
+            "schema_types_missing": missing,
+            "paa_questions_found": len(paa_questions),
+            **{k: soup_signals.get(k) for k in ["has_faq_schema", "has_author_bio", "has_credentials", "reviews_on_page", "has_about_page"]},
+        },
+        "analysis": analysis,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
+# AGENT 7 — Blog Writer
 # =============================================================================
 
 BLOG_SYSTEM = """You are an expert SEO content writer specialising in blog posts for local businesses.
@@ -2203,37 +2835,557 @@ def _send_audit_email(to_email: str, report: dict) -> None:
         logger.error(f"Failed to send audit email to {to_email}: {e}")
 
 
+# =============================================================================
+# PHASE 4 — LOCAL SEO SUB-AGENTS
+# Agents: GBP Audit | Citation Builder | Rank Tracker
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared helper — rich SERP fetch (local pack + organic rankings)
+# ---------------------------------------------------------------------------
+
+async def _fetch_serp_rich(keyword: str, location: str, target_url: str) -> dict:
+    """
+    Single SerpAPI call that returns:
+      - local_pack: up to 3 map-pack entries
+      - client_map_rank: 1-3 or None
+      - organic_results: top 20
+      - client_organic_rank: 1-20 or None
+      - serp_features: list of SERP feature names present
+    """
+    result: dict = {
+        "local_pack": [],
+        "client_map_rank": None,
+        "organic_results": [],
+        "client_organic_rank": None,
+        "serp_features": [],
+    }
+    if not SERPAPI_KEY:
+        return result
+
+    from urllib.parse import urlparse
+    client_domain = urlparse(target_url).netloc.lstrip("www.")
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "google",
+                    "q": keyword,
+                    "location": location,
+                    "num": "20",
+                    "api_key": SERPAPI_KEY,
+                },
+            )
+            if resp.status_code != 200:
+                return result
+            data = resp.json()
+    except Exception:
+        return result
+
+    # Local pack
+    for i, place in enumerate(data.get("local_results", [])[:3], start=1):
+        entry = {
+            "rank": i,
+            "title": place.get("title", ""),
+            "rating": place.get("rating"),
+            "reviews": place.get("reviews"),
+            "address": place.get("address", ""),
+            "phone": place.get("phone", ""),
+            "website": place.get("website", ""),
+            "place_id": place.get("place_id", ""),
+        }
+        result["local_pack"].append(entry)
+        if client_domain and client_domain in (entry["website"] or ""):
+            result["client_map_rank"] = i
+
+    # Organic results
+    for i, org in enumerate(data.get("organic_results", [])[:20], start=1):
+        link = org.get("link", "")
+        entry = {
+            "rank": i,
+            "title": org.get("title", ""),
+            "url": link,
+            "snippet": org.get("snippet", "")[:150],
+        }
+        result["organic_results"].append(entry)
+        if client_domain and client_domain in link:
+            result["client_organic_rank"] = i
+
+    # SERP features
+    features = []
+    if data.get("local_results"):
+        features.append("local_pack")
+    if data.get("related_questions"):
+        features.append("people_also_ask")
+    if data.get("knowledge_graph"):
+        features.append("knowledge_panel")
+    if data.get("answer_box"):
+        features.append("featured_snippet")
+    if data.get("shopping_results"):
+        features.append("shopping")
+    result["serp_features"] = features
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4a — GBP Audit Agent
+# ---------------------------------------------------------------------------
+
+GBP_SYSTEM = """You are a Google Business Profile (GBP) optimisation specialist for local businesses.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Your audit is evidence-based: you score what you can verify and clearly flag what is unknown.
+You focus on the 20% of GBP optimisations that drive 80% of Map Pack ranking improvements."""
+
+GBP_PROMPT = """Audit the Google Business Profile optimisation for this local business. Respond with valid JSON only.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+WEBSITE: {target_url}
+KEYWORD: {keyword}
+
+=== SERP DATA (live from Google) ===
+Map Pack Position: {map_pack_rank}
+Client appears in Local Pack: {in_pack}
+Map Pack Competitors:
+{map_pack_competitors}
+
+=== ON-PAGE NAP SIGNALS (from website scrape) ===
+Title tag: {title}
+H1: {h1}
+NAP on page: {nap_on_page}
+Content excerpt (first 600 chars): {content_excerpt}
+
+=== ORGANIC RANKINGS ===
+Client organic rank for keyword: {organic_rank}
+Top 5 organic competitors: {organic_competitors}
+
+Return JSON with EXACTLY this structure:
+{{
+  "gbp_score": <int 0-100>,
+  "map_pack_status": {{
+    "in_pack": {in_pack},
+    "current_rank": {map_pack_rank_raw},
+    "pack_competitors": [<list of competitor names from pack>]
+  }},
+  "completeness_audit": {{
+    "business_name_consistent": {{"status": "pass|warn|fail|unknown", "note": "<specific finding>"}},
+    "primary_category": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "service_areas": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "business_hours": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "phone_number": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "website_linked": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "photos_cover": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "photos_interior": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "posts_active": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "qa_section": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "products_services": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "review_responses": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "attributes": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}},
+    "description": {{"status": "pass|warn|fail|unknown", "note": "<finding>"}}
+  }},
+  "nap_consistency": {{
+    "name_on_website": "<business name found on page>",
+    "address_on_website": "<address found or 'not detected'>",
+    "phone_on_website": "<phone found or 'not detected'>",
+    "consistent": true|false,
+    "issues": ["<any NAP inconsistency found>"]
+  }},
+  "review_strategy": {{
+    "current_visibility": "<what reviews are visible in SERP>",
+    "recommended_target": "<realistic target review count and rating>",
+    "acquisition_tactics": ["<tactic 1>", "<tactic 2>", "<tactic 3>"]
+  }},
+  "priority_actions": [
+    {{
+      "action": "<specific GBP action>",
+      "impact": "high|medium|low",
+      "effort": "easy|medium|hard",
+      "reason": "<why this improves Map Pack ranking>",
+      "how_to": "<step-by-step implementation>"
+    }}
+  ],
+  "competitor_insights": {{
+    "what_competitors_do_better": ["<insight 1>", "<insight 2>"],
+    "gaps_to_exploit": ["<opportunity 1>", "<opportunity 2>"]
+  }},
+  "summary": {{
+    "top_priority": "<single most impactful action this week>",
+    "estimated_pack_entry_timeline": "<realistic months to enter Local Pack>",
+    "score_after_fixes": <realistic score after implementing all actions>
+  }}
+}}
+
+Rules:
+- gbp_score: score conservatively (most unoptimised businesses score 15-40)
+- completeness_audit: use "unknown" when you genuinely cannot determine from SERP/page data
+- priority_actions: exactly 5, ordered by impact descending
+- Use actual competitor names from the map pack data above, not generic placeholders
+- nap_consistency: scan the content excerpt for business name, address, and phone"""
+
+
+@app.post("/agents/gbp-audit")
+async def gbp_audit_agent(request: AuditRequest):
+    """GBP Audit — map pack position, completeness checklist, NAP consistency, review strategy."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] GBP Audit starting for '{request.target_url}'")
+
+    biz_name = request.business_name or "this business"
+    biz_type = request.business_type or "local business"
+
+    # Fetch SERP data + page data concurrently
+    serp_data, page_data = await asyncio.gather(
+        _fetch_serp_rich(request.keyword, request.location, request.target_url),
+        scrape_page(request.target_url),
+    )
+
+    # Format map pack competitors
+    pack_lines = []
+    for entry in serp_data["local_pack"]:
+        rating = f"{entry['rating']}★ ({entry['reviews']} reviews)" if entry.get("rating") else "no rating data"
+        pack_lines.append(
+            f"  #{entry['rank']}: {entry['title']} — {entry['address']} — {rating}"
+        )
+    map_pack_str = "\n".join(pack_lines) or "No local pack found for this keyword."
+
+    # Format top organic competitors
+    organic_comp_lines = [
+        f"  #{r['rank']}: {r['title']} — {r['url']}"
+        for r in serp_data["organic_results"][:5]
+    ]
+    organic_comps_str = "\n".join(organic_comp_lines) or "No organic results."
+
+    map_rank = serp_data["client_map_rank"]
+    org_rank = serp_data["client_organic_rank"]
+
+    prompt = GBP_PROMPT.format(
+        business_name=biz_name,
+        business_type=biz_type,
+        location=request.location,
+        target_url=request.target_url,
+        keyword=request.keyword,
+        map_pack_rank=f"#{map_rank}" if map_rank else "Not in top 3",
+        in_pack=bool(map_rank),
+        map_pack_rank_raw=map_rank,
+        map_pack_competitors=map_pack_str,
+        organic_rank=f"#{org_rank}" if org_rank else "Not in top 20",
+        organic_competitors=organic_comps_str,
+        title=page_data.get("title", "N/A"),
+        h1=page_data.get("h1", "N/A"),
+        nap_on_page="Check content below",
+        content_excerpt=page_data.get("content", "")[:600],
+    )
+
+    analysis = await call_claude(GBP_SYSTEM, prompt, max_tokens=2500)
+
+    return {
+        "agent": "gbp_audit",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "target_url": request.target_url,
+        "map_pack_rank": map_rank,
+        "organic_rank": org_rank,
+        "serp_features": serp_data["serp_features"],
+        "local_pack": serp_data["local_pack"],
+        "analysis": analysis,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4b — Citation Builder Agent
+# ---------------------------------------------------------------------------
+
+CITATION_SYSTEM = """You are a local SEO citations expert for small and medium businesses.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+You prioritise citations by their DA, relevance to the business type, and ease of submission.
+You focus on free citations first, paid only when the ROI is clear."""
+
+CITATION_PROMPT = """Build a prioritised citation plan for this local business. Respond with valid JSON only.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+WEBSITE: {target_url}
+KEYWORD: {keyword}
+REGION: {region}
+
+CITATION DATABASE (pre-filtered for this business):
+The following {total_citations} citations are available. Select and prioritise the best ones:
+{citation_list}
+
+Return JSON with EXACTLY this structure:
+{{
+  "citation_score": <int 0-100, estimate of current citation health>,
+  "total_in_database": {total_citations},
+  "recommendations": {{
+    "tier_1_critical": [
+      {{
+        "name": "<citation name>",
+        "submit_url": "<submission URL>",
+        "da": <int>,
+        "free": true|false,
+        "reason": "<why this specific citation matters for a {business_type}>",
+        "time_to_list": "<e.g. 1-2 days, instant, 2-4 weeks>",
+        "status": "likely_missing"
+      }}
+    ],
+    "tier_2_important": [
+      {{
+        "name": "<citation name>",
+        "submit_url": "<submission URL>",
+        "da": <int>,
+        "free": true|false,
+        "reason": "<industry-specific reason>",
+        "time_to_list": "<time estimate>",
+        "status": "likely_missing"
+      }}
+    ],
+    "tier_3_supplemental": [
+      {{
+        "name": "<citation name>",
+        "submit_url": "<submission URL>",
+        "da": <int>,
+        "free": true|false,
+        "reason": "<why worth adding>",
+        "status": "likely_missing"
+      }}
+    ]
+  }},
+  "nap_template": {{
+    "business_name": "{business_name}",
+    "address": "<format: Street, City, Province/State, Postal/Zip>",
+    "phone": "<format: (416) 555-0100 — use correct format for {location}>",
+    "website": "{target_url}",
+    "categories": ["<primary category>", "<secondary category>"],
+    "description": "<150-200 word business description optimised for citations. Mentions {location} 2-3 times. Includes primary keyword naturally.>"
+  }},
+  "consistency_rules": [
+    "<NAP consistency rule 1 — e.g. always use exact same name format>",
+    "<rule 2>",
+    "<rule 3>"
+  ],
+  "monthly_plan": {{
+    "month_1": ["<citation 1>", "<citation 2>", "<citation 3>"],
+    "month_2": ["<citation 4>", "<citation 5>"],
+    "month_3": ["<remaining citations>"]
+  }},
+  "summary": {{
+    "tier_1_count": <int>,
+    "tier_2_count": <int>,
+    "tier_3_count": <int>,
+    "total_recommended": <int>,
+    "estimated_da_impact": "<realistic DA improvement from citations alone>",
+    "time_to_complete": "<total time estimate to submit all citations>"
+  }}
+}}
+
+Rules:
+- tier_1_critical: 5-8 citations — the non-negotiables for any {business_type} in {location}
+- tier_2_important: 5-8 industry-specific or region-specific citations
+- tier_3_supplemental: 3-5 nice-to-have general directories
+- For Canadian businesses: prioritise .ca directories and include YellowPages.ca, Canada411
+- nap_template.description must be unique, locally targeted, and genuinely useful for citations
+- Do NOT include citations from the database that are clearly irrelevant to the business type"""
+
+
+@app.post("/agents/citation-builder")
+async def citation_builder_agent(request: AuditRequest):
+    """Citation Builder — loads citations.json, filters by business type/region, generates NAP template."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] Citation Builder starting for '{request.business_name}'")
+
+    biz_name = request.business_name or "this business"
+    biz_type = (request.business_type or "local business").lower()
+    location_lower = request.location.lower()
+
+    # Load citations database
+    citations_path = os.path.join(os.path.dirname(__file__), "citations.json")
+    try:
+        with open(citations_path) as f:
+            all_citations: list[dict] = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        all_citations = []
+
+    # Determine region
+    region = "ca" if any(w in location_lower for w in ["canada", " on", " bc", " ab", " qc", "ontario", "toronto", "vancouver", "montreal", "calgary"]) else "us"
+
+    # Filter: include if regions is global, matches region, or industries matches all/business type
+    def _matches(c: dict) -> bool:
+        regions = c.get("regions", ["global"])
+        inds = c.get("industries", ["all"])
+        region_ok = "global" in regions or region in regions
+        ind_ok = "all" in inds or any(
+            ind in biz_type or biz_type in ind for ind in inds
+        )
+        return region_ok and ind_ok
+
+    filtered = [c for c in all_citations if _matches(c)]
+
+    # Build compact citation list for the prompt
+    citation_lines = []
+    for c in sorted(filtered, key=lambda x: (-x.get("tier", 3), -x.get("da", 0))):
+        free_label = "FREE" if c.get("free") else "PAID"
+        citation_lines.append(
+            f"[Tier {c.get('tier',3)} | DA:{c.get('da',0)} | {free_label}] "
+            f"{c['name']} — submit: {c.get('submit_url', c['url'])}"
+        )
+
+    prompt = CITATION_PROMPT.format(
+        business_name=biz_name,
+        business_type=request.business_type or "local business",
+        location=request.location,
+        target_url=request.target_url,
+        keyword=request.keyword,
+        region=region.upper(),
+        total_citations=len(filtered),
+        citation_list="\n".join(citation_lines),
+    )
+
+    plan = await call_claude(CITATION_SYSTEM, prompt, max_tokens=2500)
+
+    return {
+        "agent": "citation_builder",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "target_url": request.target_url,
+        "region": region,
+        "citations_in_database": len(filtered),
+        "plan": plan,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4c — Rank Tracker Agent (pure data, no Claude call needed)
+# ---------------------------------------------------------------------------
+
+@app.post("/agents/rank-tracker")
+async def rank_tracker_agent(request: AuditRequest):
+    """Rank Tracker — checks live Google rankings for keyword (organic + map pack)."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] Rank Tracker starting for '{request.keyword}' → {request.target_url}")
+
+    serp_data = await _fetch_serp_rich(request.keyword, request.location, request.target_url)
+
+    organic_rank = serp_data["client_organic_rank"]
+    map_rank = serp_data["client_map_rank"]
+
+    # Determine ranking health
+    def _health(rank):
+        if rank is None:
+            return "not_ranking"
+        if rank <= 3:
+            return "excellent"
+        if rank <= 10:
+            return "good"
+        if rank <= 20:
+            return "improving"
+        return "needs_work"
+
+    # Estimate positions to close (to reach page 1 / map pack)
+    positions_to_p1 = max(0, (organic_rank or 21) - 10)
+    positions_to_pack = 0 if map_rank else 3  # need to enter pack
+
+    top_organic = [
+        {"rank": r["rank"], "title": r["title"], "url": r["url"]}
+        for r in serp_data["organic_results"][:10]
+    ]
+
+    return {
+        "agent": "rank_tracker",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "location": request.location,
+        "target_url": request.target_url,
+        "rankings": {
+            "organic_rank": organic_rank,
+            "organic_health": _health(organic_rank),
+            "map_pack_rank": map_rank,
+            "map_pack_health": _health(map_rank),
+            "in_top_10": organic_rank is not None and organic_rank <= 10,
+            "in_map_pack": map_rank is not None,
+            "positions_to_page_1": positions_to_p1,
+            "positions_to_map_pack": positions_to_pack,
+        },
+        "serp_features": serp_data["serp_features"],
+        "local_pack": serp_data["local_pack"],
+        "top_10_organic": top_organic,
+        "snapshot_date": datetime.now().isoformat(),
+    }
+
+
 @app.post("/workflow/seo-audit")
 async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = Depends(get_current_user)):
     """
     Full SEO Audit — runs keyword research first, then on-page + local + technical concurrently.
-    Total time: ~60-90 seconds instead of ~160 sequential.
+    When 'domain' is provided, crawls up to 20 pages first and passes site-wide data to agents.
+    Total time: ~60-90 seconds (single URL) or ~90-120 seconds (site crawl).
     """
     audit_id = str(uuid.uuid4())
     start = time.time()
     logger.info(f"[{audit_id}] Full audit starting for '{request.keyword}' → {request.target_url}")
 
     try:
+        # Phase 0 — site crawl (only when domain is provided)
+        crawled_pages: list[dict] = []
+        crawl_aggregate: dict = {}
+        if request.domain:
+            logger.info(f"[{audit_id}] Domain mode — crawling {request.target_url}")
+            crawled_pages = await crawl_site(request.target_url, max_pages=20)
+            crawl_aggregate = aggregate_crawl_results(crawled_pages)
+            logger.info(
+                f"[{audit_id}] Crawl done: {crawl_aggregate.get('pages_crawled', 0)} pages, "
+                f"coverage {crawl_aggregate.get('coverage_score', 0)}/100"
+            )
+
         # Phase 1 — keyword research (other agents benefit from this data)
         keyword_results = await keyword_research_agent(request)
 
-        # Phase 2 + 3 — all independent agents run concurrently
+        # Phase 2, 3 + 4 — all independent agents run concurrently
+        # For domain mode: on-page gets pre-crawled pages sorted by word count (homepage first),
+        # technical gets the site-wide aggregate for site-level recommendations.
+        sorted_pages = sorted(crawled_pages, key=lambda p: p.get("word_count", 0), reverse=True)
+        # Ensure homepage is always first
+        homepage_norm = _normalize_url(request.target_url)
+        homepage_first = [p for p in sorted_pages if _normalize_url(p["url"]) == homepage_norm]
+        other_pages = [p for p in sorted_pages if _normalize_url(p["url"]) != homepage_norm]
+        pages_for_onpage = (homepage_first + other_pages) if crawled_pages else []
+
         concurrent_tasks = [
-            on_page_seo_agent(request),
+            on_page_seo_agent(request, pre_scraped_pages=pages_for_onpage or None),
             local_seo_agent(request),
-            technical_seo_agent(request),
+            technical_seo_agent(request, crawl_aggregate=crawl_aggregate or None),
             content_rewriter_agent(request),
             backlink_analysis_agent(request),
+            link_building_agent(request),
+            ai_seo_agent(request),
+            gbp_audit_agent(request),
+            citation_builder_agent(request),
+            rank_tracker_agent(request),
         ]
         if request.include_blog:
             concurrent_tasks.append(blog_writer_agent(request))
 
         results = await asyncio.gather(*concurrent_tasks)
-        on_page_results, local_results, technical_results, rewriter_results, backlink_results = results[:5]
-        blog_results = results[5] if request.include_blog else None
+        (
+            on_page_results,
+            local_results,
+            technical_results,
+            rewriter_results,
+            backlink_results,
+            linkbuilding_results,
+            aiseo_results,
+            gbp_results,
+            citation_results,
+            rank_results,
+        ) = results[:10]
+        blog_results = results[10] if request.include_blog else None
 
         elapsed = round(time.time() - start, 1)
-        agents_run = 6 + (1 if request.include_blog else 0)
+        agents_run = 11 + (1 if request.include_blog else 0)
         logger.info(f"[{audit_id}] Audit completed in {elapsed}s ({agents_run} agents)")
 
         agents_dict = {
@@ -2243,9 +3395,35 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
             "technical_seo": technical_results,
             "content_rewriter": rewriter_results,
             "backlink_analysis": backlink_results,
+            "link_building": linkbuilding_results,
+            "ai_seo": aiseo_results,
+            "gbp_audit": gbp_results,
+            "citation_builder": citation_results,
+            "rank_tracker": rank_results,
         }
         if blog_results:
             agents_dict["blog_writer"] = blog_results
+
+        # Build per-page breakdown for site crawl results
+        pages_crawled_section = [
+            {
+                "url": p["url"],
+                "title": p.get("title", ""),
+                "meta_description": p.get("meta_description", ""),
+                "h1": p.get("h1", ""),
+                "word_count": p.get("word_count", 0),
+                "issues": [
+                    issue for issue in [
+                        "Missing title" if not p.get("title") else None,
+                        "Missing meta description" if not p.get("meta_description") else None,
+                        "Missing H1" if not p.get("h1") else None,
+                        "Thin content (<300 words)" if p.get("word_count", 0) < 300 else None,
+                    ]
+                    if issue is not None
+                ],
+            }
+            for p in crawled_pages
+        ]
 
         report = {
             "audit_id": audit_id,
@@ -2253,12 +3431,15 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
             "business_type": request.business_type or "other",
             "keyword": request.keyword,
             "target_url": request.target_url,
+            "domain": request.domain or "",
             "location": request.location,
             "status": "completed",
-            "agents_executed": agents_run,  # 6 standard + 1 optional blog
+            "agents_executed": agents_run,  # 11 standard + 1 optional blog
             "execution_time_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
             "local_seo_score": calculate_local_seo_score(on_page_results, local_results, technical_results),
+            "site_aggregate": crawl_aggregate,
+            "pages_crawled": pages_crawled_section,
             "agents": agents_dict,
             "summary": {
                 "estimated_api_cost": calculate_cost_estimate(),
