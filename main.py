@@ -164,6 +164,7 @@ class AuditRequest(BaseModel):
     business_name: Optional[str] = None
     business_type: Optional[str] = None
     user_id: Optional[str] = None
+    include_blog: bool = False  # opt-in: adds ~40s but generates a full blog post
 
     @field_validator("keyword")
     @classmethod
@@ -1650,6 +1651,161 @@ async def content_rewriter_agent(request: AuditRequest):
 
 
 # =============================================================================
+# AGENT 6 — Blog Writer
+# =============================================================================
+
+BLOG_SYSTEM = """You are an expert SEO content writer specialising in blog posts for local businesses.
+You research what's already ranking, build a data-driven brief, then write a complete post that outranks it.
+Every post is: locally targeted, keyword-optimised at 0.5-1.5% density, structured for featured snippets, and written to build topical authority."""
+
+# Call 1: content brief as compact JSON
+BLOG_BRIEF_PROMPT = """Research top-ranking content for this keyword and build a content brief. Respond with valid JSON only.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+BLOG KEYWORD: {keyword}
+
+TOP-RANKING CONTENT ANALYSED:
+{competitor_data}
+
+Return this JSON:
+{{
+  "content_brief": {{
+    "seo_title": "<60 chars, contains '{keyword}', compelling for click-through>",
+    "meta_description": "<155 chars, contains '{keyword}', includes a benefit + CTA>",
+    "h1": "<H1 that contains '{keyword}' naturally>",
+    "target_word_count": <1500-2500 based on competitor avg>,
+    "avg_competitor_length": <avg words from competitor data>,
+    "recommended_sections": [
+      {{"heading": "<H2 text>", "purpose": "<what this section should cover>"}},
+      {{"heading": "<H2 text>", "purpose": "<what this section should cover>"}}
+    ],
+    "primary_keyword": "{keyword}",
+    "semantic_keywords": ["<LSI term 1>", "<LSI term 2>", "<LSI term 3>"],
+    "questions_to_answer": ["<question 1>", "<question 2>", "<question 3>", "<question 4>", "<question 5>"],
+    "featured_snippet_opportunity": "<one specific question this post can own as a featured snippet>",
+    "internal_links": [
+      {{"anchor_text": "<text>", "target_path": "/service-page", "placement": "<which section>"}}
+    ],
+    "external_authority_links": [
+      {{"anchor_text": "<text>", "url": "<real authority URL — .gov, .edu, or major industry site>", "reason": "<why cite this>"}}
+    ]
+  }}
+}}"""
+
+# Call 2: full blog post as plain text
+BLOG_WRITE_PROMPT = """Write a complete, SEO-optimised blog post for a {business_type} in {location}.
+
+CONTENT BRIEF:
+- Title (H1): {h1}
+- Target keyword: {keyword} (use {keyword_density_target} times naturally, ~0.5-1.5% density)
+- Location: {location} (mention at least 3 times)
+- Target length: {target_word_count} words
+- Sections to include: {sections}
+- Questions to answer: {questions}
+- Featured snippet target: {featured_snippet}
+
+Write the complete blog post now. Rules:
+- Output ONLY the blog content — no JSON, no preamble, no "Here is the blog post:" intro
+- Start directly with the opening paragraph (do NOT repeat the H1 — it comes before the content)
+- Use [H2: heading text] and [H3: heading text] markers for all subheadings
+- Include a "Frequently Asked Questions" section near the end with 5 Q&As: [Q: question] [A: direct 2-3 sentence answer]
+- After the FAQ, include a brief conclusion with a call-to-action
+- Write naturally and authoritatively — the goal is to become the definitive local resource"""
+
+
+@app.post("/agents/blog-writer")
+async def blog_writer_agent(request: AuditRequest):
+    """Blog Writer — researches top-ranking posts, builds brief, writes complete 1500-2500 word blog."""
+    audit_id = str(uuid.uuid4())
+    logger.info(f"[{audit_id}] Blog Writer starting for '{request.keyword}'")
+
+    # Fetch top 5 results + scrape concurrently (1 SerpApi call)
+    competitors = await fetch_competitors(request.keyword, request.location, num=5)
+    comp_pages = await asyncio.gather(*[scrape_page(c["url"]) for c in competitors])
+
+    # Build competitor content summary
+    word_counts: list[int] = []
+    comp_summaries: list[str] = []
+    for comp, page in zip(competitors, comp_pages):
+        if not page.get("success"):
+            continue
+        wc = page.get("word_count", 0)
+        if wc > 0:
+            word_counts.append(wc)
+        headings = [h["text"] for h in page.get("headings", [])[:6]]
+        comp_summaries.append(
+            f"#{comp['position']}: {comp['title']}\n"
+            f"  URL: {comp['url']}\n"
+            f"  Word count: {wc}\n"
+            f"  Headings: {', '.join(headings)}\n"
+            f"  Content preview: {page.get('content', '')[:400]}"
+        )
+
+    avg_wc = round(sum(word_counts) / len(word_counts)) if word_counts else 1500
+    comp_data_str = "\n\n".join(comp_summaries) or "No competitor data — write authoritatively based on business type and keyword."
+
+    # Call 1: content brief (compact JSON)
+    brief_prompt = BLOG_BRIEF_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
+        location=request.location,
+        keyword=request.keyword,
+        competitor_data=comp_data_str,
+    )
+    brief = await call_claude(BLOG_SYSTEM, brief_prompt, max_tokens=1000)
+    cb = brief.get("content_brief", {})
+
+    # Pull values from brief to inform writing
+    h1 = cb.get("h1") or f"Complete Guide to {request.keyword} in {request.location}"
+    target_wc = cb.get("target_word_count") or max(avg_wc + 200, 1500)
+    sections = "; ".join(
+        f"{s['heading']} ({s['purpose']})"
+        for s in (cb.get("recommended_sections") or [])[:6]
+    ) or "Introduction, Main Services, Why Choose Us, Local Expertise, FAQ, Conclusion"
+    questions = "; ".join(cb.get("questions_to_answer") or [])[:400] or "What, Why, How, When, Cost questions"
+    featured_snippet = cb.get("featured_snippet_opportunity") or f"What is the best {request.keyword}?"
+    # Aim for 0.5-1.5% density: ~10 uses per 1500 words
+    kw_target = max(8, round(target_wc * 0.008))
+
+    # Call 2: full blog post as plain text
+    write_prompt = BLOG_WRITE_PROMPT.format(
+        business_name=request.business_name or "this business",
+        business_type=request.business_type or "local business",
+        location=request.location,
+        keyword=request.keyword,
+        h1=h1,
+        keyword_density_target=kw_target,
+        target_word_count=target_wc,
+        sections=sections,
+        questions=questions,
+        featured_snippet=featured_snippet,
+    )
+    blog_content = await call_claude(
+        BLOG_SYSTEM, write_prompt, max_tokens=4000, return_raw=True
+    )
+
+    word_count = len(blog_content.split()) if blog_content else 0
+    logger.info(f"[{audit_id}] Blog Writer done — {word_count} words written")
+
+    return {
+        "agent": "blog_writer",
+        "audit_id": audit_id,
+        "status": "completed",
+        "keyword": request.keyword,
+        "competitors_analyzed": len(comp_summaries),
+        "content_brief": cb,
+        "blog_post": {
+            "title": cb.get("seo_title", h1),
+            "meta_description": cb.get("meta_description", ""),
+            "h1": h1,
+            "word_count": word_count,
+            "content": blog_content,
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
 # ORCHESTRATOR — runs all 4 agents, builds combined report
 # =============================================================================
 
@@ -1831,15 +1987,32 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
         keyword_results = await keyword_research_agent(request)
 
         # Phase 2 — all independent agents run concurrently
-        on_page_results, local_results, technical_results, rewriter_results = await asyncio.gather(
+        concurrent_tasks = [
             on_page_seo_agent(request),
             local_seo_agent(request),
             technical_seo_agent(request),
             content_rewriter_agent(request),
-        )
+        ]
+        if request.include_blog:
+            concurrent_tasks.append(blog_writer_agent(request))
+
+        results = await asyncio.gather(*concurrent_tasks)
+        on_page_results, local_results, technical_results, rewriter_results = results[:4]
+        blog_results = results[4] if request.include_blog else None
 
         elapsed = round(time.time() - start, 1)
-        logger.info(f"[{audit_id}] Audit completed in {elapsed}s")
+        agents_run = 5 + (1 if request.include_blog else 0)
+        logger.info(f"[{audit_id}] Audit completed in {elapsed}s ({agents_run} agents)")
+
+        agents_dict = {
+            "keyword_research": keyword_results,
+            "on_page_seo": on_page_results,
+            "local_seo": local_results,
+            "technical_seo": technical_results,
+            "content_rewriter": rewriter_results,
+        }
+        if blog_results:
+            agents_dict["blog_writer"] = blog_results
 
         report = {
             "audit_id": audit_id,
@@ -1849,17 +2022,11 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
             "target_url": request.target_url,
             "location": request.location,
             "status": "completed",
-            "agents_executed": 5,
+            "agents_executed": agents_run,
             "execution_time_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
             "local_seo_score": calculate_local_seo_score(on_page_results, local_results, technical_results),
-            "agents": {
-                "keyword_research": keyword_results,
-                "on_page_seo": on_page_results,
-                "local_seo": local_results,
-                "technical_seo": technical_results,
-                "content_rewriter": rewriter_results,
-            },
+            "agents": agents_dict,
             "summary": {
                 "estimated_api_cost": calculate_cost_estimate(),
                 "quick_wins": build_quick_wins(keyword_results, on_page_results, local_results, technical_results),
