@@ -1,7 +1,7 @@
 # =============================================================================
 # SEO SaaS Platform — FastAPI Backend
 # =============================================================================
-# 3-Agent Local SEO Audit System
+# Local SEO Audit System — 4 AI agents
 #
 # Agents:
 #   1. Keyword Research  — competitor gaps, intent mapping, clusters
