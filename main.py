@@ -239,6 +239,23 @@ def get_current_user(authorization: Optional[str] = Header(default=None)) -> Cur
     return CurrentUser(id=user_id, email=email)
 
 
+def get_optional_user(authorization: Optional[str] = Header(default=None)) -> Optional[CurrentUser]:
+    """Like get_current_user but returns None instead of raising for missing/invalid tokens.
+    Use on endpoints that work for both authenticated and anonymous users."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization[len("Bearer "):]
+    try:
+        payload = jose_jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id: str = payload.get("sub")
+        email: str = payload.get("email")
+        if user_id and email:
+            return CurrentUser(id=user_id, email=email)
+    except JWTError:
+        pass
+    return None
+
+
 class RegisterRequest(BaseModel):
     email: str
     password: str
@@ -3318,7 +3335,7 @@ async def rank_tracker_agent(request: AuditRequest):
 
 
 @app.post("/workflow/seo-audit")
-async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = Depends(get_current_user)):
+async def seo_audit_workflow(request: AuditRequest, current_user: Optional[CurrentUser] = Depends(get_optional_user)):
     """
     Full SEO Audit — runs keyword research first, then on-page + local + technical concurrently.
     When 'domain' is provided, crawls up to 20 pages first and passes site-wide data to agents.
@@ -3449,10 +3466,12 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
 
         # Persist to DB — run in thread pool so we don't block the event loop
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed, current_user.id)
+        user_id_for_db = current_user.id if current_user else None
+        await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed, user_id_for_db)
 
         # Send audit summary email (non-blocking — failure won't affect response)
-        await loop.run_in_executor(None, _send_audit_email, current_user.email, report)
+        if current_user:
+            await loop.run_in_executor(None, _send_audit_email, current_user.email, report)
 
         return report
 
