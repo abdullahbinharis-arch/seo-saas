@@ -111,12 +111,36 @@ async def startup_event():
 
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
+RATE_LIMIT_WHITELIST: set[str] = {
+    e.strip().lower()
+    for e in os.getenv("RATE_LIMIT_WHITELIST", "").split(",")
+    if e.strip()
+}
+
+
+def _get_token_email(request: Request) -> str | None:
+    """Extract email from Bearer JWT without raising — for whitelist check only."""
+    try:
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        from jose import jwt as _jose_jwt
+        payload = _jose_jwt.decode(auth[7:], JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return (payload.get("email") or "").lower()
+    except Exception:
+        return None
 
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if request.url.path.startswith(("/health", "/info", "/docs", "/openapi")):
         return await call_next(request)
+
+    # Whitelisted users bypass rate limiting entirely
+    if RATE_LIMIT_WHITELIST:
+        email = _get_token_email(request)
+        if email and email in RATE_LIMIT_WHITELIST:
+            return await call_next(request)
 
     ip = request.client.host if request.client else "unknown"
     now = time.time()
