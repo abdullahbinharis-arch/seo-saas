@@ -1054,46 +1054,30 @@ async def scrape_competitors(competitors: list[dict]) -> str:
 # Claude helper — centralised, with retry
 # ---------------------------------------------------------------------------
 
-# Lazily-created semaphore — must be initialised inside the running event loop
-# (Python < 3.10 raises if you create asyncio primitives at module level).
-_claude_semaphore: asyncio.Semaphore | None = None
-
-
-def _get_claude_semaphore() -> asyncio.Semaphore:
-    global _claude_semaphore
-    if _claude_semaphore is None:
-        _claude_semaphore = asyncio.Semaphore(2)
-    return _claude_semaphore
-
-
 async def call_claude(
     system: str,
     prompt: str,
     max_tokens: int = 2000,
-    retries: int = 4,
+    retries: int = 3,
     return_raw: bool = False,
 ) -> dict | str:
     """
     Call Claude with a system prompt and user prompt.
-    - Limits concurrency to 2 simultaneous calls via semaphore.
-    - On rate-limit (429) errors, waits 65 s before retrying so the
-      per-minute quota window resets fully.
-    - On other transient errors, waits 3 s × attempt number.
+    Retries on transient failures with backoff.
+    On rate-limit (429) errors, waits 30 s before retrying.
     Returns parsed JSON dict by default, or raw text string if return_raw=True.
     """
-    sem = _get_claude_semaphore()
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            async with sem:
-                response = await anthropic_client.messages.create(
-                    model=CLAUDE_MODEL,
-                    max_tokens=max_tokens,
-                    system=system,
-                    messages=[
-                        {"role": "user", "content": prompt},
-                    ],
-                )
+            response = await anthropic_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+            )
             raw = response.content[0].text
             if return_raw:
                 return raw
@@ -1103,10 +1087,10 @@ async def call_claude(
             last_error = e
             err_str = str(e)
             is_rate_limit = "rate_limit" in err_str.lower() or "429" in err_str
-            wait = 65 if is_rate_limit else 3 * attempt
+            wait = 30 if is_rate_limit else 2 * attempt
             logger.warning(
                 f"Claude call attempt {attempt}/{retries} failed "
-                f"({'rate limit — waiting 65 s' if is_rate_limit else f'retrying in {wait} s'}): {e}"
+                f"({'rate limit — waiting 30 s' if is_rate_limit else f'retrying in {wait} s'}): {e}"
             )
             if attempt < retries:
                 await asyncio.sleep(wait)
@@ -3513,10 +3497,8 @@ async def seo_audit_workflow(request: AuditRequest, current_user: Optional[Curre
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logger.error(f"[{audit_id}] Audit failed: {e}\n{tb}")
-        raise HTTPException(500, f"Audit failed: {type(e).__name__}: {e}")
+        logger.error(f"[{audit_id}] Audit failed: {e}", exc_info=True)
+        raise HTTPException(500, "Audit failed — please try again")
 
 
 def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: str = None) -> None:
