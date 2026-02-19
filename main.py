@@ -49,6 +49,8 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "LocalRank <reports@localrank.io>")
 
 if not ANTHROPIC_API_KEY:
     logger.warning("⚠️  ANTHROPIC_API_KEY is not set — Claude calls will fail")
@@ -1111,6 +1113,97 @@ def calculate_cost_estimate(agents_run: int = 4) -> float:
     return round(input_cost + output_cost, 4)
 
 
+def _send_audit_email(to_email: str, report: dict) -> None:
+    """Send a branded HTML audit summary email via Resend."""
+    if not RESEND_API_KEY:
+        logger.warning("RESEND_API_KEY not set — skipping email")
+        return
+
+    import resend
+    resend.api_key = RESEND_API_KEY
+
+    business_name = report.get("business_name") or report.get("target_url", "Your Business")
+    business_type = report.get("business_type", "")
+    score = report.get("local_seo_score", 0)
+    quick_wins = report.get("summary", {}).get("quick_wins", [])
+    audit_id = report.get("audit_id", "")
+
+    # Score colour
+    if score >= 70:
+        score_color = "#10b981"
+        score_label = "Good"
+    elif score >= 40:
+        score_color = "#f59e0b"
+        score_label = "Needs Work"
+    else:
+        score_color = "#ef4444"
+        score_label = "Poor"
+
+    wins_html = "".join(
+        f'<li style="margin-bottom:8px;color:#d1d5db;">{w}</li>'
+        for w in quick_wins[:5]
+    )
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#09090b;font-family:system-ui,-apple-system,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#09090b;padding:40px 16px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+
+        <!-- Header -->
+        <tr><td style="background:#0f0f12;border:1px solid rgba(255,255,255,0.06);border-radius:16px 16px 0 0;padding:32px 40px;text-align:center;">
+          <div style="display:inline-flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <div style="width:36px;height:36px;background:linear-gradient(135deg,#34d399,#059669);border-radius:10px;display:inline-block;vertical-align:middle;"></div>
+            <span style="font-size:20px;font-weight:700;color:#ffffff;vertical-align:middle;">LocalRank</span>
+          </div>
+          <p style="margin:8px 0 0;color:#71717a;font-size:14px;">Your Local SEO Audit Report is ready</p>
+        </td></tr>
+
+        <!-- Score card -->
+        <tr><td style="background:#18181b;border-left:1px solid rgba(255,255,255,0.06);border-right:1px solid rgba(255,255,255,0.06);padding:32px 40px;text-align:center;">
+          <p style="margin:0 0 4px;color:#a1a1aa;font-size:13px;text-transform:uppercase;letter-spacing:0.05em;">Local SEO Score</p>
+          <p style="margin:0;font-size:72px;font-weight:900;color:{score_color};line-height:1;">{score}</p>
+          <p style="margin:4px 0 0;color:{score_color};font-size:16px;font-weight:600;">{score_label}</p>
+          <div style="background:rgba(255,255,255,0.08);border-radius:999px;height:8px;margin:20px auto;max-width:300px;overflow:hidden;">
+            <div style="background:{score_color};height:8px;width:{score}%;border-radius:999px;"></div>
+          </div>
+          <p style="margin:0;color:#71717a;font-size:13px;">{business_name}{f" &middot; {business_type}" if business_type else ""}</p>
+        </td></tr>
+
+        <!-- Quick wins -->
+        {"" if not wins_html else f'''
+        <tr><td style="background:#0f0f12;border-left:1px solid rgba(255,255,255,0.06);border-right:1px solid rgba(255,255,255,0.06);padding:28px 40px;">
+          <p style="margin:0 0 16px;color:#ffffff;font-size:15px;font-weight:600;">⚡ Top Quick Wins</p>
+          <ul style="margin:0;padding-left:20px;">{wins_html}</ul>
+        </td></tr>'''}
+
+        <!-- CTA -->
+        <tr><td style="background:#18181b;border:1px solid rgba(255,255,255,0.06);border-radius:0 0 16px 16px;padding:32px 40px;text-align:center;">
+          <p style="margin:0 0 20px;color:#a1a1aa;font-size:14px;">Your full report includes keyword research, on-page fixes, citation opportunities, and a complete local SEO strategy.</p>
+          <p style="margin:0 0 28px;color:#52525b;font-size:12px;">Audit ID: {audit_id[:8]}</p>
+          <p style="margin:24px 0 0;color:#52525b;font-size:11px;">LocalRank &mdash; AI-Powered Local SEO Platform</p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    try:
+        resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"Your Local SEO Audit is Ready — Score: {score}/100",
+            "html": html,
+        })
+        logger.info(f"Audit email sent to {to_email}")
+    except Exception as e:
+        logger.error(f"Failed to send audit email to {to_email}: {e}")
+
+
 @app.post("/workflow/seo-audit")
 async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = Depends(get_current_user)):
     """
@@ -1162,6 +1255,9 @@ async def seo_audit_workflow(request: AuditRequest, current_user: CurrentUser = 
         # Persist to DB — run in thread pool so we don't block the event loop
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed, current_user.id)
+
+        # Send audit summary email (non-blocking — failure won't affect response)
+        await loop.run_in_executor(None, _send_audit_email, current_user.email, report)
 
         return report
 
