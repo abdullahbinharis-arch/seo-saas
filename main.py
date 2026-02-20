@@ -3958,29 +3958,6 @@ async def health():
     }
 
 
-@app.get("/debug/db-test")
-async def debug_db_test():
-    """Temporary diagnostic — test DB read/write on audits table."""
-    db = SessionLocal()
-    try:
-        # Count existing audits
-        count = db.query(Audit).count()
-        # Try a test write + rollback
-        test_audit = Audit(
-            id="test-000", user_id=None, keyword="test", target_url="https://test.com",
-            location="Test", status="test", results_json='{"test": true}',
-            api_cost=0.0, execution_time=0.0,
-        )
-        db.add(test_audit)
-        db.flush()  # force SQL execution
-        db.rollback()  # don't actually keep it
-        return {"db_ok": True, "audit_count": count, "write_test": "passed"}
-    except Exception as e:
-        db.rollback()
-        return {"db_ok": False, "error": f"{type(e).__name__}: {e}"}
-    finally:
-        db.close()
-
 
 @app.get("/info")
 async def info():
