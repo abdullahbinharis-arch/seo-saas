@@ -113,6 +113,9 @@ async def startup_event():
 
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
+
+# In-memory store for background audit tasks: audit_id -> {"status": ..., "result": ...}
+_pending_audits: dict[str, dict] = {}
 RATE_LIMIT_WHITELIST: set[str] = {
     e.strip().lower()
     for e in os.getenv("RATE_LIMIT_WHITELIST", "").split(",")
@@ -3619,11 +3622,34 @@ async def rank_tracker_agent(request: AuditRequest):
 @app.post("/workflow/seo-audit")
 async def seo_audit_workflow(request: AuditRequest, current_user: Optional[CurrentUser] = Depends(get_optional_user)):
     """
+    Full SEO Audit — returns immediately with audit_id, runs in background.
+    Poll GET /audits/{audit_id}/status for results.
+    """
+    audit_id = str(uuid.uuid4())
+    _pending_audits[audit_id] = {"status": "processing"}
+    asyncio.create_task(_run_audit_background(audit_id, request, current_user))
+    return {"audit_id": audit_id, "status": "processing"}
+
+
+async def _run_audit_background(audit_id: str, request: AuditRequest, current_user) -> None:
+    """Run the full audit in the background and store result in _pending_audits."""
+    try:
+        result = await _do_audit_core(audit_id, request, current_user)
+        _pending_audits[audit_id] = {"status": "completed", "result": result}
+    except Exception as e:
+        logger.error(f"[{audit_id}] Background audit failed: {e}", exc_info=True)
+        _pending_audits[audit_id] = {"status": "failed"}
+    # Auto-clean from memory after 2 hours
+    await asyncio.sleep(7200)
+    _pending_audits.pop(audit_id, None)
+
+
+async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> dict:
+    """
     Full SEO Audit — runs keyword research first, then on-page + local + technical concurrently.
     When 'domain' is provided, crawls up to 20 pages first and passes site-wide data to agents.
     Total time: ~60-90 seconds (single URL) or ~90-120 seconds (site crawl).
     """
-    audit_id = str(uuid.uuid4())
     start = time.time()
     logger.info(f"[{audit_id}] Full audit starting for '{request.keyword}' → {request.target_url}")
 
@@ -3781,7 +3807,7 @@ async def seo_audit_workflow(request: AuditRequest, current_user: Optional[Curre
         raise
     except Exception as e:
         logger.error(f"[{audit_id}] Audit failed: {e}", exc_info=True)
-        raise HTTPException(500, "Audit failed — please try again")
+        raise
 
 
 def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: str = None) -> None:
@@ -3803,6 +3829,34 @@ def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: s
         logger.info(f"[{audit_id}] Saved to database")
     except Exception as e:
         logger.error(f"[{audit_id}] DB save failed: {e}")
+    finally:
+        db.close()
+
+
+# =============================================================================
+# Audit status polling (no auth — audit_id is the token)
+# =============================================================================
+
+@app.get("/audits/{audit_id}/status")
+def get_audit_status(audit_id: str):
+    """
+    Poll for background audit completion.
+    Returns {"status": "processing"}, {"status": "failed"}, or the full report with {"status": "completed", ...}.
+    No authentication required — the audit_id itself acts as the access token.
+    """
+    entry = _pending_audits.get(audit_id)
+    if entry is not None:
+        if entry["status"] == "completed":
+            return entry["result"]
+        return {"status": entry["status"]}
+
+    # Not in memory — check DB (handles server restart edge case)
+    db = SessionLocal()
+    try:
+        row = db.query(Audit).filter(Audit.id == audit_id).first()
+        if row and row.results_json:
+            return json.loads(row.results_json)
+        raise HTTPException(status_code=404, detail="Audit not found")
     finally:
         db.close()
 
