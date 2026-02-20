@@ -2696,67 +2696,341 @@ async def blog_writer_agent(request: AuditRequest):
 # ORCHESTRATOR — runs all 4 agents, builds combined report
 # =============================================================================
 
-def calculate_local_seo_score(op: dict, local: dict, tech: dict) -> int:
-    """Compute composite Local SEO Score (0-100) from agent outputs."""
-    # On-page SEO: 30% weight (agent returns seo_score 0-100)
-    op_score = op.get("recommendations", {}).get("current_analysis", {}).get("seo_score", 50)
-    op_score = max(0, min(100, int(op_score)))
+def calculate_ai_seo_score_from_signals(signals: dict) -> int:
+    """Estimate AI SEO score from collected page signals when agent score is missing."""
+    score = 0
+    if signals.get("has_faq_schema"):
+        score += 20
+    if signals.get("has_author_bio"):
+        score += 15
+    if signals.get("has_credentials"):
+        score += 10
+    schema_found = signals.get("schema_types_found") or []
+    score += min(15, len(schema_found) * 5)
+    if signals.get("reviews_on_page"):
+        score += 10
+    if signals.get("has_about_page"):
+        score += 10
+    paa = signals.get("paa_questions_found", 0)
+    score += min(15, int(paa) * 3)
+    return min(100, score)
 
-    # Technical: 20% weight (agent returns technical_score 0-10, scale to 0-100)
+
+def calculate_pillar_scores(agents: dict) -> dict:
+    """Calculate 0-100 scores for each pillar plus overall weighted average."""
+    op = agents.get("on_page_seo", {})
+    tech = agents.get("technical_seo", {})
+    local = agents.get("local_seo", {})
+    backlink = agents.get("backlink_analysis", {})
+    ai_seo = agents.get("ai_seo", {})
+    gbp = agents.get("gbp_audit", {})
+    citation = agents.get("citation_builder", {})
+
+    # Website SEO: on-page 60% + technical 40%
+    on_page_score = op.get("recommendations", {}).get("current_analysis", {}).get("seo_score", 50)
+    on_page_score = max(0, min(100, int(on_page_score)))
     tech_raw = tech.get("recommendations", {}).get("technical_score", 5)
     tech_score = max(0, min(10, int(tech_raw))) * 10
+    website_seo = max(0, min(100, int(on_page_score * 0.60 + tech_score * 0.40)))
 
-    # Local SEO: 50% weight (agent returns local_seo_score 0-100)
+    # Backlinks: domain authority score (0-100)
+    da_score = backlink.get("recommendations", {}).get("domain_authority", {}).get("score", 0)
+    backlinks_score = max(0, min(100, int(da_score)))
+
+    # Local SEO: local_seo 40% + gbp 35% + citation 25%
     local_score = local.get("recommendations", {}).get("local_seo_score", 35)
     local_score = max(0, min(100, int(local_score)))
+    gbp_score = gbp.get("analysis", {}).get("gbp_score", 30)
+    gbp_score = max(0, min(100, int(gbp_score)))
+    citation_score = citation.get("plan", {}).get("citation_score", 20)
+    citation_score = max(0, min(100, int(citation_score)))
+    local_seo = max(0, min(100, int(local_score * 0.40 + gbp_score * 0.35 + citation_score * 0.25)))
 
-    combined = int(op_score * 0.30 + tech_score * 0.20 + local_score * 0.50)
-    return min(100, max(0, combined))
+    # AI SEO: use agent score if present, else calculate from signals
+    ai_visibility = ai_seo.get("analysis", {}).get("ai_visibility_score", 0)
+    if ai_visibility:
+        ai_seo_score = max(0, min(100, int(ai_visibility)))
+    else:
+        signals = ai_seo.get("signals_collected", {})
+        ai_seo_score = calculate_ai_seo_score_from_signals(signals)
+
+    # Overall: website 35% + local 30% + backlinks 20% + ai 15%
+    overall = max(0, min(100, int(
+        website_seo * 0.35 + local_seo * 0.30 + backlinks_score * 0.20 + ai_seo_score * 0.15
+    )))
+
+    return {
+        "overall": overall,
+        "website_seo": website_seo,
+        "backlinks": backlinks_score,
+        "local_seo": local_seo,
+        "ai_seo": ai_seo_score,
+    }
 
 
-def build_quick_wins(kw: dict, op: dict, local: dict, tech: dict) -> list[str]:
-    """Extract real quick wins from each agent's output instead of hardcoding."""
-    wins = []
+def build_structured_quick_wins(agents: dict) -> list[dict]:
+    """Build top 10 structured quick-win objects from all agent outputs."""
+    wins: list[dict] = []
 
-    # From keyword research
-    rec = kw.get("recommendations", {})
-    if isinstance(rec, dict) and rec.get("recommendation"):
-        wins.append(rec["recommendation"][:200])
+    def _add(title: str, description: str, pillar: str, priority: str = "high",
+             impact: str = "", time_estimate: str = "") -> None:
+        if not title:
+            return
+        wins.append({
+            "rank": len(wins) + 1,
+            "title": title[:120],
+            "description": description or title,
+            "pillar": pillar,
+            "priority": priority,
+            "impact": impact,
+            "time_estimate": time_estimate,
+        })
 
-    # From on-page
-    op_rec = op.get("recommendations", {})
-    if isinstance(op_rec, dict):
-        recs = op_rec.get("recommendations", {})
-        if isinstance(recs, dict) and recs.get("meta_title"):
-            wins.append(f"Update title tag to: \"{recs['meta_title']}\"")
-        priority = op_rec.get("priority_actions", [])
-        if isinstance(priority, list):
-            wins.extend(priority[:2])
+    # On-Page priority actions
+    op_rec = agents.get("on_page_seo", {}).get("recommendations", {})
+    for action in (op_rec.get("priority_actions") or [])[:2]:
+        if isinstance(action, str) and action:
+            _add(action, action, "website_seo", "high", "Improve search rankings", "1-2 hours")
 
-    # From local SEO
-    local_rec = local.get("recommendations", {})
-    if isinstance(local_rec, dict):
-        local_wins = local_rec.get("quick_wins", [])
-        if isinstance(local_wins, list):
-            wins.extend(local_wins[:2])
+    # Technical priority fixes
+    tech_rec = agents.get("technical_seo", {}).get("recommendations", {})
+    for fix in (tech_rec.get("priority_fixes") or [])[:2]:
+        if isinstance(fix, str) and fix:
+            _add(fix, fix, "website_seo", "high", "Fix critical technical issues", "30-60 min")
 
-    # From technical SEO
-    tech_rec = tech.get("recommendations", {})
-    if isinstance(tech_rec, dict):
-        tech_wins = tech_rec.get("quick_wins", [])
-        if isinstance(tech_wins, list):
-            wins.extend(tech_wins[:2])
+    # Local SEO quick wins
+    local_rec = agents.get("local_seo", {}).get("recommendations", {})
+    for win in (local_rec.get("quick_wins") or [])[:2]:
+        if isinstance(win, str) and win:
+            _add(win, win, "local_seo", "high", "Improve local rankings", "1-2 hours")
 
-    # Fallback if agents didn't return structured data
+    # GBP priority actions
+    gbp_analysis = agents.get("gbp_audit", {}).get("analysis", {})
+    for action in (gbp_analysis.get("priority_actions") or [])[:2]:
+        if isinstance(action, dict):
+            _add(action.get("action", ""), action.get("reason", "") or action.get("how_to", ""),
+                 "local_seo", action.get("impact", "medium"), action.get("how_to", ""), "30-60 min")
+        elif isinstance(action, str) and action:
+            _add(action, action, "local_seo", "medium", "", "30 min")
+
+    # AI SEO priority actions
+    ai_analysis = agents.get("ai_seo", {}).get("analysis", {})
+    for action in (ai_analysis.get("priority_actions") or [])[:2]:
+        if isinstance(action, dict):
+            _add(action.get("action", ""), action.get("why", "") or action.get("how", ""),
+                 "ai_seo", action.get("impact", "medium"), action.get("how", ""),
+                 action.get("effort", "1-2 hours"))
+        elif isinstance(action, str) and action:
+            _add(action, action, "ai_seo", "medium", "", "30 min")
+
+    # Citation tier 1
+    citation_plan = agents.get("citation_builder", {}).get("plan", {})
+    for cite in (citation_plan.get("recommendations", {}).get("tier_1_critical") or [])[:2]:
+        if isinstance(cite, dict) and cite.get("name"):
+            _add(f"Build citation on {cite['name']}", cite.get("reason", "Build local authority"),
+                 "local_seo", "medium", f"DA: {cite.get('da', '?')}", cite.get("time_to_list", "1 hour"))
+
+    # Backlink quick wins
+    backlink_rec = agents.get("backlink_analysis", {}).get("recommendations", {})
+    for win in (backlink_rec.get("quick_wins") or [])[:2]:
+        if isinstance(win, str) and win:
+            _add(win, win, "backlinks", "low", "Improve domain authority", "1-2 weeks")
+
+    # Fallback
     if not wins:
         wins = [
-            "Complete Google Business Profile optimisation",
-            "Update meta title and description with target keyword",
-            "Build citations on top local directories",
-            "Add internal links between service pages",
+            {"rank": 1, "title": "Complete Google Business Profile optimisation", "description": "Fill all GBP fields, add 40+ photos, select the right primary category.", "pillar": "local_seo", "priority": "high", "impact": "Map Pack visibility", "time_estimate": "2 hours"},
+            {"rank": 2, "title": "Update meta title and description with target keyword", "description": "Write a compelling 60-char title and 155-char description with your primary keyword.", "pillar": "website_seo", "priority": "high", "impact": "+20% CTR from search", "time_estimate": "10 min"},
+            {"rank": 3, "title": "Build citations on top local directories", "description": "Submit your business to Google, Yelp, BBB, and industry-specific directories.", "pillar": "local_seo", "priority": "high", "impact": "+10-15 local authority", "time_estimate": "1 hour each"},
+            {"rank": 4, "title": "Add internal links between service pages", "description": "Link related service pages together to distribute link equity.", "pillar": "website_seo", "priority": "medium", "impact": "Better site structure", "time_estimate": "30 min"},
         ]
+        return wins
 
-    return wins[:8]
+    for i, win in enumerate(wins[:10]):
+        win["rank"] = i + 1
+    return wins[:10]
+
+
+def _make_step(rank: int, title: str, description: str, category: str, priority: str,
+               impact: str = "", time_estimate: str = "") -> dict:
+    return {
+        "rank": rank,
+        "title": title[:120] if title else "",
+        "description": description or title,
+        "category": category,
+        "priority": priority,
+        "impact": impact,
+        "time_estimate": time_estimate,
+    }
+
+
+def build_pillar_steps(agents: dict, scores: dict) -> dict:
+    """Build 5 improvement steps per pillar from agent outputs."""
+
+    # === Website SEO ===
+    website_steps: list[dict] = []
+    op_rec = agents.get("on_page_seo", {}).get("recommendations", {})
+    tech_rec = agents.get("technical_seo", {}).get("recommendations", {})
+    for action in (op_rec.get("priority_actions") or [])[:3]:
+        if isinstance(action, str) and action:
+            website_steps.append(_make_step(len(website_steps) + 1, action, action, "On-Page", "high", "", "1-2 hours"))
+    for fix in (tech_rec.get("priority_fixes") or [])[:3]:
+        if isinstance(fix, str) and fix and len(website_steps) < 5:
+            website_steps.append(_make_step(len(website_steps) + 1, fix, fix, "Technical", "medium", "", "30-60 min"))
+    for win in (tech_rec.get("quick_wins") or [])[:2]:
+        if isinstance(win, str) and win and len(website_steps) < 5:
+            website_steps.append(_make_step(len(website_steps) + 1, win, win, "Technical", "low", "", "15 min"))
+    if not website_steps:
+        website_steps = [
+            _make_step(1, "Update meta title and description", "Write a compelling title (60 chars) and description (155 chars) with your primary keyword.", "On-Page", "high", "+20% CTR from search", "10 min"),
+            _make_step(2, "Improve content depth to 1,500+ words", "Add service descriptions, FAQs, and testimonials to match top-ranking competitors.", "Content", "high", "+20-30 organic positions", "3 hours"),
+            _make_step(3, "Optimize page speed — images, lazy loading, defer scripts", "Convert images to WebP, add loading='lazy', defer non-critical JS. Target PageSpeed 70+ on mobile.", "Technical", "medium", "Better Core Web Vitals", "2 hours"),
+            _make_step(4, "Add alt text to all images with local keywords", "Use descriptive, keyword-rich alt text on every image.", "Technical", "medium", "Image search visibility", "30 min"),
+            _make_step(5, "Add canonical tags + submit XML sitemap", "Prevents duplicate content and speeds up indexing.", "Technical", "low", "Cleaner crawl budget", "15 min"),
+        ]
+    for i, s in enumerate(website_steps[:5]):
+        s["rank"] = i + 1
+
+    # === Backlinks ===
+    backlink_steps: list[dict] = []
+    backlink_rec = agents.get("backlink_analysis", {}).get("recommendations", {})
+    lb_rec = agents.get("link_building", {}).get("recommendations", {})
+    for issue in (backlink_rec.get("top_issues") or [])[:2]:
+        if isinstance(issue, str) and issue:
+            backlink_steps.append(_make_step(len(backlink_steps) + 1, issue, issue, "Profile", "high", "", "1-2 weeks"))
+    for opp in (lb_rec.get("quick_wins") or [])[:3]:
+        if isinstance(opp, dict) and len(backlink_steps) < 5:
+            name = opp.get("name", "")
+            reason = opp.get("reason", "")
+            backlink_steps.append(_make_step(
+                len(backlink_steps) + 1,
+                f"Submit to {name}" if name else reason,
+                reason or f"Get a backlink from {name}",
+                (opp.get("link_type") or "Directory").capitalize(),
+                opp.get("difficulty", "medium"),
+                f"Est. DA: {opp.get('expected_da', '?')}",
+                "1-2 hours",
+            ))
+    for opp in (lb_rec.get("local_opportunities") or [])[:2]:
+        if isinstance(opp, dict) and len(backlink_steps) < 5:
+            name = opp.get("name", "")
+            reason = opp.get("reason", "")
+            backlink_steps.append(_make_step(
+                len(backlink_steps) + 1,
+                f"Partner with {name}" if name else reason,
+                reason or f"Local link opportunity: {name}",
+                "Local",
+                opp.get("difficulty", "medium"),
+                f"Est. DA: {opp.get('expected_da', '?')}",
+                "1-2 weeks",
+            ))
+    if not backlink_steps:
+        backlink_steps = [
+            _make_step(1, "Submit to industry directories", "Find and submit to the top 5 industry-specific directories in your niche.", "Directory", "high", "DA increase", "2 hours"),
+            _make_step(2, "Guest post on local blogs and news sites", "Pitch relevant articles to local publications. DA 50+ links have the highest impact.", "Guest Post", "high", "High-DA backlink", "2 weeks"),
+            _make_step(3, "Create a linkable content asset", "Build a resource (guide, calculator, data report) that naturally attracts links over time.", "Content", "medium", "Passive link acquisition", "1 week"),
+            _make_step(4, "Sponsor a local event or association", "Get citations from event websites, local press, and partner sites.", "Sponsorship", "medium", "Local authority signal", "2 weeks"),
+            _make_step(5, "Analyse competitor backlinks for gaps", "Find sites linking to competitors but not you — and pitch them your content.", "Strategy", "low", "Link gap closure", "2 hours"),
+        ]
+    for i, s in enumerate(backlink_steps[:5]):
+        s["rank"] = i + 1
+
+    # === Local SEO ===
+    local_steps: list[dict] = []
+    local_rec = agents.get("local_seo", {}).get("recommendations", {})
+    gbp_analysis = agents.get("gbp_audit", {}).get("analysis", {})
+    citation_plan = agents.get("citation_builder", {}).get("plan", {})
+    for action in (gbp_analysis.get("priority_actions") or [])[:2]:
+        if isinstance(action, dict) and action.get("action"):
+            local_steps.append(_make_step(
+                len(local_steps) + 1,
+                action.get("action", ""),
+                action.get("reason", "") or action.get("how_to", ""),
+                "GBP",
+                action.get("impact", "high"),
+                action.get("how_to", ""),
+                "30-60 min",
+            ))
+    for win in (local_rec.get("quick_wins") or [])[:3]:
+        if isinstance(win, str) and win and len(local_steps) < 5:
+            local_steps.append(_make_step(len(local_steps) + 1, win, win, "Local SEO", "high", "", "1-2 hours"))
+    for cite in (citation_plan.get("recommendations", {}).get("tier_1_critical") or [])[:2]:
+        if isinstance(cite, dict) and cite.get("name") and len(local_steps) < 5:
+            local_steps.append(_make_step(
+                len(local_steps) + 1,
+                f"Build citation on {cite['name']}",
+                cite.get("reason", ""),
+                "Citations",
+                "medium",
+                f"DA: {cite.get('da', '?')}",
+                cite.get("time_to_list", "1 hour"),
+            ))
+    if not local_steps:
+        local_steps = [
+            _make_step(1, "Complete Google Business Profile", "Fill all fields, upload 40+ photos, add services with descriptions, seed 10 Q&As.", "GBP", "high", "Map Pack visibility", "2 hours"),
+            _make_step(2, "Build top directory citations", "Submit to Google, Yelp, BBB, and industry-specific directories with consistent NAP.", "Citations", "high", "+10-15 local authority", "1 hour each"),
+            _make_step(3, "Start review acquisition campaign", "Send review requests after every job. Target 4+ reviews per month.", "Reviews", "medium", "Improved local rankings", "Ongoing"),
+            _make_step(4, "Create service area pages", "Build individual pages for each city/neighbourhood you serve with unique content.", "Content", "medium", "Rank for local terms", "2 hours each"),
+            _make_step(5, "Post weekly on GBP", "Share project photos, tips, and seasonal offers. Consistency signals active business.", "GBP Posts", "low", "Engagement signal", "Ongoing"),
+        ]
+    for i, s in enumerate(local_steps[:5]):
+        s["rank"] = i + 1
+
+    # === AI SEO ===
+    ai_steps: list[dict] = []
+    ai_analysis = agents.get("ai_seo", {}).get("analysis", {})
+    for action in (ai_analysis.get("priority_actions") or [])[:5]:
+        if isinstance(action, dict) and action.get("action"):
+            ai_steps.append(_make_step(
+                len(ai_steps) + 1,
+                action.get("action", ""),
+                action.get("why", "") or action.get("how", ""),
+                "Content Structure",
+                action.get("impact", "medium"),
+                action.get("how", ""),
+                "1-3 hours",
+            ))
+    if not ai_steps:
+        ai_steps = [
+            _make_step(1, "Add FAQ section with FAQPage schema", "Create 8-10 Q&A pairs answering common customer questions. Add JSON-LD FAQPage schema markup.", "Content Structure", "high", "Featured snippets + AI citations", "1 hour"),
+            _make_step(2, "Build E-E-A-T signals (author bios + About page)", "Create team page with photos, experience, licenses, certifications. Link from every page.", "E-E-A-T", "high", "Trusted source for AI engines", "1-2 hours"),
+            _make_step(3, "Write a definitive industry guide (3,000+ words)", "Create the most comprehensive resource on your topic — the #1 content AI engines cite.", "Topical Authority", "medium", "AI citation likelihood", "1 day"),
+            _make_step(4, "Add original data and local statistics", "Include pricing tables, project data, and local market stats unique to your business.", "Citation Potential", "medium", "Citable source", "2-3 hours"),
+            _make_step(5, "Rewrite key content in direct-answer format", "Lead each section with a clear answer, then supporting detail. Avoid burying key info.", "Content Format", "low", "AI extraction friendly", "Ongoing"),
+        ]
+    for i, s in enumerate(ai_steps[:5]):
+        s["rank"] = i + 1
+
+    return {
+        "website_seo": {
+            "score": scores.get("website_seo", 0),
+            "title": "Website SEO",
+            "subtitle": "Page speed, on-page optimization, technical health, keyword positioning",
+            "color": "blue",
+            "steps": website_steps[:5],
+        },
+        "backlinks": {
+            "score": scores.get("backlinks", 0),
+            "title": "Backlink & Link Building",
+            "subtitle": "Domain authority, referring domains, link acquisition strategy",
+            "color": "rose",
+            "steps": backlink_steps[:5],
+        },
+        "local_seo": {
+            "score": scores.get("local_seo", 0),
+            "title": "Local SEO",
+            "subtitle": "Google Business Profile, citations, NAP consistency, local rankings",
+            "color": "amber",
+            "steps": local_steps[:5],
+        },
+        "ai_seo": {
+            "score": scores.get("ai_seo", 0),
+            "title": "AI SEO Visibility",
+            "subtitle": "Optimization for ChatGPT, Perplexity, Google AI Overviews, Gemini",
+            "color": "violet",
+            "steps": ai_steps[:5],
+        },
+    }
 
 
 def calculate_cost_estimate(agents_run: int = 4) -> float:
@@ -2779,8 +3053,9 @@ def _send_audit_email(to_email: str, report: dict) -> None:
 
     business_name = report.get("business_name") or report.get("target_url", "Your Business")
     business_type = report.get("business_type", "")
-    score = report.get("local_seo_score", 0)
-    quick_wins = report.get("summary", {}).get("quick_wins", [])
+    score = report.get("scores", {}).get("overall", report.get("local_seo_score", 0))
+    quick_wins_raw = report.get("quick_wins", report.get("summary", {}).get("quick_wins", []))
+    quick_wins = [w.get("title", str(w)) if isinstance(w, dict) else str(w) for w in quick_wins_raw[:5]]
     audit_id = report.get("audit_id", "")
 
     # Score colour
@@ -3461,6 +3736,11 @@ async def seo_audit_workflow(request: AuditRequest, current_user: Optional[Curre
             for p in crawled_pages
         ]
 
+        # Calculate structured scores and step data
+        scores = calculate_pillar_scores(agents_dict)
+        structured_wins = build_structured_quick_wins(agents_dict)
+        pillars = build_pillar_steps(agents_dict, scores)
+
         report = {
             "audit_id": audit_id,
             "business_name": request.business_name or "",
@@ -3470,16 +3750,19 @@ async def seo_audit_workflow(request: AuditRequest, current_user: Optional[Curre
             "domain": request.domain or "",
             "location": request.location,
             "status": "completed",
-            "agents_executed": agents_run,  # 11 standard + 1 optional blog
+            "agents_executed": agents_run,
             "execution_time_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
-            "local_seo_score": calculate_local_seo_score(on_page_results, local_results, technical_results),
+            "scores": scores,
+            "local_seo_score": scores["overall"],  # backward compat
+            "quick_wins": structured_wins,
+            "pillars": pillars,
             "site_aggregate": crawl_aggregate,
             "pages_crawled": pages_crawled_section,
             "agents": agents_dict,
             "summary": {
                 "estimated_api_cost": calculate_cost_estimate(),
-                "quick_wins": build_quick_wins(keyword_results, on_page_results, local_results, technical_results),
+                "quick_wins": [w["title"] for w in structured_wins],  # backward compat string list
             },
         }
 
