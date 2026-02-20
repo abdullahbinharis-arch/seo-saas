@@ -3813,6 +3813,8 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
 def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: str = None) -> None:
     """Synchronous DB write — called via run_in_executor."""
     try:
+        # Sanitize JSON: remove null bytes (PostgreSQL rejects \x00 in text columns)
+        results_str = json.dumps(report, default=str).replace("\x00", "")
         db = SessionLocal()
         db.add(Audit(
             id=audit_id,
@@ -3821,14 +3823,14 @@ def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: s
             target_url=request.target_url,
             location=request.location,
             status="completed",
-            results_json=json.dumps(report),
-            api_cost=report["summary"]["estimated_api_cost"],
+            results_json=results_str,
+            api_cost=report.get("summary", {}).get("estimated_api_cost", 0.0),
             execution_time=elapsed,
         ))
         db.commit()
-        logger.info(f"[{audit_id}] Saved to database")
+        logger.info(f"[{audit_id}] Saved to database (user={user_id})")
     except Exception as e:
-        logger.error(f"[{audit_id}] DB save failed: {e}")
+        logger.error(f"[{audit_id}] DB save failed: {type(e).__name__}: {e}", exc_info=True)
     finally:
         db.close()
 
