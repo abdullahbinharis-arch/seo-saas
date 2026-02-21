@@ -2879,13 +2879,41 @@ def build_score_details(agents: dict) -> dict:
     }
 
 
+def _ensure_list(val) -> list:
+    """Normalise an agent output value to a list.
+
+    Agents sometimes return strings instead of lists (e.g. a paragraph
+    describing priority actions). This splits strings into items by
+    newlines or numbered bullets so downstream code can iterate safely.
+    """
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, dict):
+        return [val]
+    if isinstance(val, str):
+        # Split by newlines, numbered bullets (1. 2.), or dashes/bullets
+        items = []
+        for line in re.split(r'\n|(?<=\. )(?=\d+\.)', val):
+            line = line.strip().lstrip("0123456789.-•) ").strip()
+            if line and len(line) > 15:  # skip trivially short fragments
+                items.append(line)
+        return items if items else ([val.strip()] if val.strip() and len(val.strip()) > 15 else [])
+    return []
+
+
 def build_structured_quick_wins(agents: dict) -> list[dict]:
     """Build top 10 structured quick-win objects from all agent outputs."""
     wins: list[dict] = []
 
     def _add(title: str, description: str, pillar: str, priority: str = "high",
              impact: str = "", time_estimate: str = "") -> None:
-        if not title:
+        if not title or len(wins) >= 10:
+            return
+        # Deduplicate by title (case-insensitive first 60 chars)
+        norm = title[:60].lower()
+        if any(w["title"][:60].lower() == norm for w in wins):
             return
         wins.append({
             "rank": len(wins) + 1,
@@ -2897,53 +2925,69 @@ def build_structured_quick_wins(agents: dict) -> list[dict]:
             "time_estimate": time_estimate,
         })
 
-    # On-Page priority actions
-    op_rec = agents.get("on_page_seo", {}).get("recommendations", {})
-    for action in (op_rec.get("priority_actions") or [])[:2]:
+    # On-Page priority actions — check top-level and nested path
+    op_full = agents.get("on_page_seo", {}).get("recommendations", {})
+    op_actions = _ensure_list(
+        op_full.get("priority_actions")
+        or op_full.get("recommendations", {}).get("priority_actions") if isinstance(op_full.get("recommendations"), dict) else None
+    )
+    # Fallback: issues_found from current_analysis
+    if not op_actions:
+        op_actions = _ensure_list(op_full.get("current_analysis", {}).get("issues_found"))
+    for action in op_actions[:3]:
         if isinstance(action, str) and action:
             _add(action, action, "website_seo", "high", "Improve search rankings", "1-2 hours")
 
-    # Technical priority fixes
-    tech_rec = agents.get("technical_seo", {}).get("recommendations", {})
-    for fix in (tech_rec.get("priority_fixes") or [])[:2]:
+    # Technical priority fixes — check top-level and nested
+    tech_full = agents.get("technical_seo", {}).get("recommendations", {})
+    tech_fixes = _ensure_list(
+        tech_full.get("priority_fixes")
+        or tech_full.get("recommendations", {}).get("priority_fixes") if isinstance(tech_full.get("recommendations"), dict) else None
+    )
+    if not tech_fixes:
+        tech_fixes = _ensure_list(tech_full.get("quick_wins"))
+    for fix in tech_fixes[:2]:
         if isinstance(fix, str) and fix:
             _add(fix, fix, "website_seo", "high", "Fix critical technical issues", "30-60 min")
 
-    # Local SEO quick wins
+    # Local SEO quick wins — increased limit
     local_rec = agents.get("local_seo", {}).get("recommendations", {})
-    for win in (local_rec.get("quick_wins") or [])[:2]:
+    for win in _ensure_list(local_rec.get("quick_wins"))[:3]:
         if isinstance(win, str) and win:
             _add(win, win, "local_seo", "high", "Improve local rankings", "1-2 hours")
 
-    # GBP priority actions
+    # GBP priority actions — handle string values
     gbp_analysis = agents.get("gbp_audit", {}).get("analysis", {})
-    for action in (gbp_analysis.get("priority_actions") or [])[:2]:
+    for action in _ensure_list(gbp_analysis.get("priority_actions"))[:2]:
         if isinstance(action, dict):
             _add(action.get("action", ""), action.get("reason", "") or action.get("how_to", ""),
                  "local_seo", action.get("impact", "medium"), action.get("how_to", ""), "30-60 min")
         elif isinstance(action, str) and action:
-            _add(action, action, "local_seo", "medium", "", "30 min")
+            _add(action, action, "local_seo", "medium", "Improve GBP visibility", "30 min")
 
-    # AI SEO priority actions
+    # AI SEO priority actions — handle string values
     ai_analysis = agents.get("ai_seo", {}).get("analysis", {})
-    for action in (ai_analysis.get("priority_actions") or [])[:2]:
+    for action in _ensure_list(ai_analysis.get("priority_actions"))[:2]:
         if isinstance(action, dict):
             _add(action.get("action", ""), action.get("why", "") or action.get("how", ""),
                  "ai_seo", action.get("impact", "medium"), action.get("how", ""),
                  action.get("effort", "1-2 hours"))
         elif isinstance(action, str) and action:
-            _add(action, action, "ai_seo", "medium", "", "30 min")
+            _add(action, action, "ai_seo", "medium", "Improve AI visibility", "1-2 hours")
 
-    # Citation tier 1
+    # Citation tier 1 — handle string values
     citation_plan = agents.get("citation_builder", {}).get("plan", {})
-    for cite in (citation_plan.get("recommendations", {}).get("tier_1_critical") or [])[:2]:
+    tier1 = _ensure_list(citation_plan.get("recommendations", {}).get("tier_1_critical") if isinstance(citation_plan.get("recommendations"), dict) else None)
+    for cite in tier1[:1]:
         if isinstance(cite, dict) and cite.get("name"):
             _add(f"Build citation on {cite['name']}", cite.get("reason", "Build local authority"),
                  "local_seo", "medium", f"DA: {cite.get('da', '?')}", cite.get("time_to_list", "1 hour"))
+        elif isinstance(cite, str) and cite:
+            _add(cite, cite, "local_seo", "medium", "Build local authority", "1 hour")
 
     # Backlink quick wins
     backlink_rec = agents.get("backlink_analysis", {}).get("recommendations", {})
-    for win in (backlink_rec.get("quick_wins") or [])[:2]:
+    for win in _ensure_list(backlink_rec.get("quick_wins"))[:2]:
         if isinstance(win, str) and win:
             _add(win, win, "backlinks", "low", "Improve domain authority", "1-2 weeks")
 
@@ -2980,15 +3024,27 @@ def build_pillar_steps(agents: dict, scores: dict) -> dict:
 
     # === Website SEO ===
     website_steps: list[dict] = []
-    op_rec = agents.get("on_page_seo", {}).get("recommendations", {})
-    tech_rec = agents.get("technical_seo", {}).get("recommendations", {})
-    for action in (op_rec.get("priority_actions") or [])[:3]:
+    op_full = agents.get("on_page_seo", {}).get("recommendations", {})
+    tech_full = agents.get("technical_seo", {}).get("recommendations", {})
+    # On-page: check top-level and nested, fallback to issues_found
+    op_actions = _ensure_list(
+        op_full.get("priority_actions")
+        or (op_full.get("recommendations", {}).get("priority_actions") if isinstance(op_full.get("recommendations"), dict) else None)
+    )
+    if not op_actions:
+        op_actions = _ensure_list(op_full.get("current_analysis", {}).get("issues_found"))
+    for action in op_actions[:3]:
         if isinstance(action, str) and action:
             website_steps.append(_make_step(len(website_steps) + 1, action, action, "On-Page", "high", "", "1-2 hours"))
-    for fix in (tech_rec.get("priority_fixes") or [])[:3]:
+    # Technical: check top-level and nested, fallback to quick_wins
+    tech_fixes = _ensure_list(
+        tech_full.get("priority_fixes")
+        or (tech_full.get("recommendations", {}).get("priority_fixes") if isinstance(tech_full.get("recommendations"), dict) else None)
+    )
+    for fix in tech_fixes[:3]:
         if isinstance(fix, str) and fix and len(website_steps) < 5:
             website_steps.append(_make_step(len(website_steps) + 1, fix, fix, "Technical", "medium", "", "30-60 min"))
-    for win in (tech_rec.get("quick_wins") or [])[:2]:
+    for win in _ensure_list(tech_full.get("quick_wins"))[:2]:
         if isinstance(win, str) and win and len(website_steps) < 5:
             website_steps.append(_make_step(len(website_steps) + 1, win, win, "Technical", "low", "", "15 min"))
     if not website_steps:
@@ -3051,7 +3107,7 @@ def build_pillar_steps(agents: dict, scores: dict) -> dict:
     local_rec = agents.get("local_seo", {}).get("recommendations", {})
     gbp_analysis = agents.get("gbp_audit", {}).get("analysis", {})
     citation_plan = agents.get("citation_builder", {}).get("plan", {})
-    for action in (gbp_analysis.get("priority_actions") or [])[:2]:
+    for action in _ensure_list(gbp_analysis.get("priority_actions"))[:2]:
         if isinstance(action, dict) and action.get("action"):
             local_steps.append(_make_step(
                 len(local_steps) + 1,
@@ -3062,10 +3118,13 @@ def build_pillar_steps(agents: dict, scores: dict) -> dict:
                 action.get("how_to", ""),
                 "30-60 min",
             ))
-    for win in (local_rec.get("quick_wins") or [])[:3]:
+        elif isinstance(action, str) and action:
+            local_steps.append(_make_step(len(local_steps) + 1, action, action, "GBP", "high", "", "30-60 min"))
+    for win in _ensure_list(local_rec.get("quick_wins"))[:3]:
         if isinstance(win, str) and win and len(local_steps) < 5:
             local_steps.append(_make_step(len(local_steps) + 1, win, win, "Local SEO", "high", "", "1-2 hours"))
-    for cite in (citation_plan.get("recommendations", {}).get("tier_1_critical") or [])[:2]:
+    tier1_local = _ensure_list(citation_plan.get("recommendations", {}).get("tier_1_critical") if isinstance(citation_plan.get("recommendations"), dict) else None)
+    for cite in tier1_local[:2]:
         if isinstance(cite, dict) and cite.get("name") and len(local_steps) < 5:
             local_steps.append(_make_step(
                 len(local_steps) + 1,
@@ -3076,6 +3135,8 @@ def build_pillar_steps(agents: dict, scores: dict) -> dict:
                 f"DA: {cite.get('da', '?')}",
                 cite.get("time_to_list", "1 hour"),
             ))
+        elif isinstance(cite, str) and cite and len(local_steps) < 5:
+            local_steps.append(_make_step(len(local_steps) + 1, cite, cite, "Citations", "medium", "", "1 hour"))
     if not local_steps:
         local_steps = [
             _make_step(1, "Complete Google Business Profile", "Fill all fields, upload 40+ photos, add services with descriptions, seed 10 Q&As.", "GBP", "high", "Map Pack visibility", "2 hours"),
@@ -3090,7 +3151,7 @@ def build_pillar_steps(agents: dict, scores: dict) -> dict:
     # === AI SEO ===
     ai_steps: list[dict] = []
     ai_analysis = agents.get("ai_seo", {}).get("analysis", {})
-    for action in (ai_analysis.get("priority_actions") or [])[:5]:
+    for action in _ensure_list(ai_analysis.get("priority_actions"))[:5]:
         if isinstance(action, dict) and action.get("action"):
             ai_steps.append(_make_step(
                 len(ai_steps) + 1,
@@ -3101,6 +3162,8 @@ def build_pillar_steps(agents: dict, scores: dict) -> dict:
                 action.get("how", ""),
                 "1-3 hours",
             ))
+        elif isinstance(action, str) and action:
+            ai_steps.append(_make_step(len(ai_steps) + 1, action, action, "Content Structure", "medium", "", "1-3 hours"))
     if not ai_steps:
         ai_steps = [
             _make_step(1, "Add FAQ section with FAQPage schema", "Create 8-10 Q&A pairs answering common customer questions. Add JSON-LD FAQPage schema markup.", "Content Structure", "high", "Featured snippets + AI citations", "1 hour"),
