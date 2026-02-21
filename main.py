@@ -163,7 +163,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # =============================================================================
 
 class AuditRequest(BaseModel):
-    keyword: str
+    keyword: Optional[str] = None
     target_url: str = ""
     domain: Optional[str] = None  # Alternative to target_url — triggers site-wide crawl
     location: str = "Toronto, Canada"
@@ -174,8 +174,12 @@ class AuditRequest(BaseModel):
 
     @field_validator("keyword")
     @classmethod
-    def keyword_valid(cls, v: str) -> str:
+    def keyword_valid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         v = v.strip()
+        if not v:
+            return None
         if len(v) < 2:
             raise ValueError("Keyword must be at least 2 characters")
         if len(v) > 200:
@@ -1183,6 +1187,104 @@ async def call_claude(
 
 
 # =============================================================================
+# Auto-detect keyword — scrapes site + asks Claude to infer business type/keyword
+# =============================================================================
+
+AUTODETECT_SYSTEM = """You are an expert SEO analyst. Given scraped website data, you detect the business type and the best primary keyword a potential customer would Google to find this business locally.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble."""
+
+AUTODETECT_PROMPT = """Analyze this website and determine the business type and best local search keyword.
+
+BUSINESS NAME (user-provided): {business_name}
+LOCATION: {location}
+WEBSITE URL: {target_url}
+
+SCRAPED PAGE DATA:
+- Page title: {title}
+- Meta description: {meta_description}
+- H1: {h1}
+- Headings: {headings}
+- Content preview (first 1500 chars): {content}
+
+Based on the page content, return JSON with EXACTLY these keys:
+{{
+  "business_type": "the specific business category, e.g. 'Kitchen Remodeler', 'Family Dentist', 'Personal Injury Lawyer'",
+  "primary_keyword": "the #1 keyword a local customer would Google to find this business, e.g. 'kitchen remodeler near me', 'dentist near me'",
+  "secondary_keywords": ["3-5 additional high-intent local keywords"],
+  "services": ["list of main services offered on the page"],
+  "detected_name": "the business name as it appears on the website"
+}}
+
+Rules:
+- primary_keyword MUST include a local modifier like 'near me' or the city name
+- business_type should be specific (not just 'business' or 'company')
+- secondary_keywords should be service-specific local searches
+- If the page content is thin or unclear, make your best inference from the URL, title, and business name"""
+
+
+async def auto_detect_keyword(request: AuditRequest) -> dict:
+    """Scrape the target URL and ask Claude to detect business type + primary keyword."""
+    logger.info(f"Auto-detecting keyword for {request.target_url}")
+
+    try:
+        page_data = await scrape_page(request.target_url)
+
+        if not page_data.get("success"):
+            logger.warning(f"Scrape failed for auto-detect — using fallback")
+            return _fallback_detection(request)
+
+        headings_text = ", ".join(
+            f"{h['level']}: {h['text']}" for h in page_data.get("headings", [])[:15]
+        )
+
+        prompt = AUTODETECT_PROMPT.format(
+            business_name=request.business_name or "Unknown",
+            location=request.location,
+            target_url=request.target_url,
+            title=page_data.get("title", "N/A"),
+            meta_description=page_data.get("meta_description", "N/A"),
+            h1=page_data.get("h1", "N/A"),
+            headings=headings_text or "N/A",
+            content=page_data.get("content", "")[:1500],
+        )
+
+        result = await call_claude(AUTODETECT_SYSTEM, prompt, max_tokens=500)
+
+        if isinstance(result, dict) and result.get("primary_keyword"):
+            logger.info(f"Auto-detected: type='{result.get('business_type')}', keyword='{result['primary_keyword']}'")
+            return result
+
+        logger.warning("Claude auto-detect returned empty — using fallback")
+        return _fallback_detection(request)
+
+    except Exception as e:
+        logger.error(f"Auto-detect failed: {e}")
+        return _fallback_detection(request)
+
+
+def _fallback_detection(request: AuditRequest) -> dict:
+    """Construct a reasonable keyword when scrape or Claude fails."""
+    from urllib.parse import urlparse
+
+    if request.business_type:
+        kw = f"{request.business_type} near me"
+    elif request.business_name:
+        kw = f"{request.business_name} near me"
+    else:
+        domain = urlparse(request.target_url).netloc.replace("www.", "")
+        name = domain.split(".")[0].replace("-", " ").replace("_", " ").title()
+        kw = f"{name} near me"
+
+    return {
+        "business_type": request.business_type or "local business",
+        "primary_keyword": kw,
+        "secondary_keywords": [],
+        "services": [],
+        "detected_name": request.business_name or "",
+    }
+
+
+# =============================================================================
 # AGENT 1 — Keyword Research
 # =============================================================================
 
@@ -1255,7 +1357,7 @@ Rules:
 
 
 @app.post("/agents/keyword-research")
-async def keyword_research_agent(request: AuditRequest):
+async def keyword_research_agent(request: AuditRequest, secondary_keywords: list[str] | None = None):
     """Keyword Research Agent — density, semantic keywords, gap analysis, clusters."""
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] Keyword Research starting for '{request.keyword}'")
@@ -1290,6 +1392,10 @@ async def keyword_research_agent(request: AuditRequest):
         # Competitors
         competitor_data=competitor_data,
     )
+
+    # Append auto-detected secondary keywords when available
+    if secondary_keywords:
+        prompt += f"\n\nAlso analyze these related keywords detected from the website: {', '.join(secondary_keywords)}"
 
     recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=2500)
 
@@ -3977,6 +4083,9 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
     start = time.time()
     logger.info(f"[{audit_id}] Full audit starting for '{request.keyword}' → {request.target_url}")
 
+    auto_detected: dict | None = None
+    secondary_keywords: list[str] | None = None
+
     try:
         # Phase 0 — site crawl (only when domain is provided)
         crawled_pages: list[dict] = []
@@ -3990,8 +4099,19 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
                 f"coverage {crawl_aggregate.get('coverage_score', 0)}/100"
             )
 
+        # Phase 0.5 — auto-detect keyword (only when keyword is not provided)
+        if not request.keyword:
+            logger.info(f"[{audit_id}] No keyword provided — running auto-detection")
+            auto_detected = await auto_detect_keyword(request)
+            request.keyword = auto_detected["primary_keyword"]
+            secondary_keywords = auto_detected.get("secondary_keywords") or None
+            # Fill in business_type if user didn't provide one
+            if not request.business_type and auto_detected.get("business_type"):
+                request.business_type = auto_detected["business_type"]
+            logger.info(f"[{audit_id}] Auto-detected keyword='{request.keyword}', type='{request.business_type}'")
+
         # Phase 1 — keyword research (other agents benefit from this data)
-        keyword_results = await keyword_research_agent(request)
+        keyword_results = await keyword_research_agent(request, secondary_keywords=secondary_keywords)
 
         # Phase 2, 3 + 4 — all independent agents run concurrently
         # For domain mode: on-page gets pre-crawled pages sorted by word count (homepage first),
@@ -4115,6 +4235,7 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
             "seo_tasks": seo_tasks,
             "site_aggregate": crawl_aggregate,
             "pages_crawled": pages_crawled_section,
+            "auto_detected": auto_detected,  # None when keyword was user-provided
             "agents": agents_dict,
             "summary": {
                 "estimated_api_cost": est_cost,
