@@ -2736,9 +2736,18 @@ def calculate_pillar_scores(agents: dict) -> dict:
     tech_score = max(0, min(10, int(tech_raw))) * 10
     website_seo = max(0, min(100, int(on_page_score * 0.60 + tech_score * 0.40)))
 
-    # Backlinks: domain authority score (0-100)
-    da_score = backlink.get("recommendations", {}).get("domain_authority", {}).get("score", 0)
-    backlinks_score = max(0, min(100, int(da_score)))
+    # Backlinks: map DA range to a 0-100 pillar score
+    da_raw = backlink.get("recommendations", {}).get("domain_authority", {}).get("score", 0)
+    da_val = max(0, min(100, int(da_raw)))
+    if da_val < 20:
+        backlinks_score = 10 + int((da_val / 20) * 15)        # 0-20 DA → 10-25
+    elif da_val < 40:
+        backlinks_score = 25 + int(((da_val - 20) / 20) * 25)  # 20-40 DA → 25-50
+    elif da_val < 60:
+        backlinks_score = 50 + int(((da_val - 40) / 20) * 25)  # 40-60 DA → 50-75
+    else:
+        backlinks_score = 75 + int(((da_val - 60) / 40) * 25)  # 60-100 DA → 75-100
+    backlinks_score = max(0, min(100, backlinks_score))
 
     # Local SEO: local_seo 40% + gbp 35% + citation 25%
     local_score = local.get("recommendations", {}).get("local_seo_score", 35)
@@ -2757,9 +2766,9 @@ def calculate_pillar_scores(agents: dict) -> dict:
         signals = ai_seo.get("signals_collected", {})
         ai_seo_score = calculate_ai_seo_score_from_signals(signals)
 
-    # Overall: website 35% + local 30% + backlinks 20% + ai 15%
+    # Overall: website 30% + local 30% + backlinks 20% + ai 20%
     overall = max(0, min(100, int(
-        website_seo * 0.35 + local_seo * 0.30 + backlinks_score * 0.20 + ai_seo_score * 0.15
+        website_seo * 0.30 + local_seo * 0.30 + backlinks_score * 0.20 + ai_seo_score * 0.20
     )))
 
     return {
@@ -2768,6 +2777,105 @@ def calculate_pillar_scores(agents: dict) -> dict:
         "backlinks": backlinks_score,
         "local_seo": local_seo,
         "ai_seo": ai_seo_score,
+    }
+
+
+def build_score_details(agents: dict) -> dict:
+    """Build sub-score details for each pillar, extracted from raw agent data."""
+    op = agents.get("on_page_seo", {})
+    tech = agents.get("technical_seo", {})
+    backlink = agents.get("backlink_analysis", {})
+    local = agents.get("local_seo", {})
+    gbp = agents.get("gbp_audit", {})
+    citation = agents.get("citation_builder", {})
+    ai = agents.get("ai_seo", {})
+
+    # Website SEO sub-scores
+    op_rec = op.get("recommendations", {})
+    tech_rec = tech.get("recommendations", {})
+    current = op_rec.get("current_analysis", {})
+    on_page_raw = current.get("seo_score", 0)
+    on_page_val = max(0, min(100, int(on_page_raw * 10) if on_page_raw <= 10 else int(on_page_raw)))
+    tech_raw = tech_rec.get("technical_score", 5)
+    tech_val = max(0, min(100, int(tech_raw) * 10 if int(tech_raw) <= 10 else int(tech_raw)))
+    page_speed = tech_rec.get("page_speed_score", tech_val)
+    page_speed = max(0, min(100, int(page_speed)))
+    issues = current.get("issues_found", [])
+    issues_count = len(issues) if isinstance(issues, list) else 0
+
+    # Backlink sub-scores
+    bl_rec = backlink.get("recommendations", {})
+    da_obj = bl_rec.get("domain_authority", {})
+    estimated_da = int(da_obj.get("score", 0))
+    linking_domains = da_obj.get("linking_domains", 0) or bl_rec.get("total_backlinks", 0)
+    estimated_backlinks = int(linking_domains) if linking_domains else 0
+    competitors = bl_rec.get("competitors", []) or backlink.get("analysis", {}).get("competitors", [])
+    if competitors and isinstance(competitors, list):
+        comp_das = [int(c.get("domain_authority", 0)) for c in competitors if isinstance(c, dict)]
+        competitors_avg_da = int(sum(comp_das) / len(comp_das)) if comp_das else 0
+    else:
+        competitors_avg_da = 0
+
+    # Local SEO sub-scores
+    gbp_analysis = gbp.get("analysis", {})
+    gbp_score = gbp_analysis.get("gbp_score", 0)
+    if gbp_score and int(gbp_score) >= 70:
+        gbp_status = "optimized"
+    elif gbp_score and int(gbp_score) >= 40:
+        gbp_status = "needs optimization"
+    else:
+        gbp_status = "not optimized"
+    cit_plan = citation.get("plan", {})
+    cit_recs = cit_plan.get("recommendations", {})
+    citations_found = cit_plan.get("existing_citations", 0)
+    if not citations_found:
+        citations_found = cit_plan.get("summary", {}).get("existing_count", 0)
+    t1 = len(cit_recs.get("tier_1_critical", []))
+    t2 = len(cit_recs.get("tier_2_important", []))
+    t3 = len(cit_recs.get("tier_3_supplemental", []))
+    citations_needed = t1 + t2 + t3
+    review_count = gbp_analysis.get("review_count", 0)
+    if not review_count:
+        review_count = gbp_analysis.get("map_pack_status", {}).get("reviews", 0)
+
+    # AI SEO sub-scores
+    signals = ai.get("signals_collected", {})
+    analysis = ai.get("analysis", {})
+    has_faq = bool(signals.get("has_faq_schema") or analysis.get("score_breakdown", {}).get("faq_content", 0) > 5)
+    has_eeat = bool(signals.get("has_author_bio") or analysis.get("score_breakdown", {}).get("eeat_signals", 0) > 5)
+    word_count = op_rec.get("current_analysis", {}).get("word_count", 0)
+    if word_count >= 1500:
+        content_depth = "comprehensive"
+    elif word_count >= 800:
+        content_depth = "adequate"
+    elif word_count >= 300:
+        content_depth = "thin"
+    else:
+        content_depth = "very thin"
+
+    return {
+        "website_seo": {
+            "page_speed": page_speed,
+            "on_page": on_page_val,
+            "technical": tech_val,
+            "issues_count": issues_count,
+        },
+        "backlinks": {
+            "estimated_da": estimated_da,
+            "estimated_backlinks": estimated_backlinks,
+            "competitors_avg_da": competitors_avg_da,
+        },
+        "local_seo": {
+            "gbp_status": gbp_status,
+            "citations_found": int(citations_found),
+            "citations_needed": citations_needed,
+            "review_count": int(review_count),
+        },
+        "ai_seo": {
+            "faq_schema": has_faq,
+            "eeat_signals": has_eeat,
+            "content_depth": content_depth,
+        },
     }
 
 
@@ -3034,6 +3142,56 @@ def build_pillar_steps(agents: dict, scores: dict) -> dict:
             "steps": ai_steps[:5],
         },
     }
+
+
+def build_seo_tasks(quick_wins: list[dict], pillars: dict) -> list[dict]:
+    """Build a flat task list from quick wins + pillar steps for the SEO Tasks view."""
+    seen_titles: set[str] = set()
+    tasks: list[dict] = []
+    task_counter = 0
+
+    def _add_task(title: str, pillar: str, priority: str, time_est: str = "",
+                  impact: str = "") -> None:
+        nonlocal task_counter
+        norm = title.strip().lower()
+        if norm in seen_titles or not title:
+            return
+        seen_titles.add(norm)
+        task_counter += 1
+        tasks.append({
+            "id": f"task_{task_counter}",
+            "title": title[:150],
+            "pillar": pillar,
+            "priority": priority,
+            "time_estimate": time_est,
+            "impact": impact,
+            "status": "pending",
+        })
+
+    # First: add all quick wins (these are the highest priority)
+    for win in quick_wins:
+        _add_task(
+            win.get("title", ""),
+            win.get("pillar", ""),
+            win.get("priority", "medium"),
+            win.get("time_estimate", ""),
+            win.get("impact", ""),
+        )
+
+    # Then: add pillar steps that weren't already covered by quick wins
+    for pillar_key, pillar_data in pillars.items():
+        if not isinstance(pillar_data, dict):
+            continue
+        for step in pillar_data.get("steps", []):
+            _add_task(
+                step.get("title", ""),
+                pillar_key,
+                step.get("priority", "medium"),
+                step.get("time_estimate", ""),
+                step.get("impact", ""),
+            )
+
+    return tasks
 
 
 def calculate_cost_estimate(agents_run: int = 4) -> float:
@@ -3764,8 +3922,11 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
 
         # Calculate structured scores and step data
         scores = calculate_pillar_scores(agents_dict)
+        score_details = build_score_details(agents_dict)
         structured_wins = build_structured_quick_wins(agents_dict)
         pillars = build_pillar_steps(agents_dict, scores)
+        seo_tasks = build_seo_tasks(structured_wins, pillars)
+        est_cost = calculate_cost_estimate()
 
         report = {
             "audit_id": audit_id,
@@ -3778,16 +3939,19 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
             "status": "completed",
             "agents_executed": agents_run,
             "execution_time_seconds": elapsed,
+            "estimated_cost": est_cost,
             "timestamp": datetime.now().isoformat(),
             "scores": scores,
+            "score_details": score_details,
             "local_seo_score": scores["overall"],  # backward compat
             "quick_wins": structured_wins,
             "pillars": pillars,
+            "seo_tasks": seo_tasks,
             "site_aggregate": crawl_aggregate,
             "pages_crawled": pages_crawled_section,
             "agents": agents_dict,
             "summary": {
-                "estimated_api_cost": calculate_cost_estimate(),
+                "estimated_api_cost": est_cost,
                 "quick_wins": [w["title"] for w in structured_wins],  # backward compat string list
             },
         }
@@ -3909,6 +4073,47 @@ def get_audit(audit_id: str, current_user: CurrentUser = Depends(get_current_use
         if not row:
             raise HTTPException(status_code=404, detail="Audit not found")
         return json.loads(row.results_json)
+    finally:
+        db.close()
+
+
+@app.patch("/audits/{audit_id}/tasks/{task_id}")
+def update_task_status(
+    audit_id: str,
+    task_id: str,
+    body: dict,
+    current_user: CurrentUser = Depends(get_optional_user),
+):
+    """Toggle a single SEO task status (completed/pending)."""
+    new_status = body.get("status", "completed")
+    if new_status not in ("completed", "pending"):
+        raise HTTPException(status_code=400, detail="status must be 'completed' or 'pending'")
+
+    db = SessionLocal()
+    try:
+        filters = [Audit.id == audit_id]
+        if current_user:
+            filters.append(Audit.user_id == current_user.id)
+        row = db.query(Audit).filter(*filters).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Audit not found")
+
+        audit_data = json.loads(row.results_json)
+        tasks = audit_data.get("seo_tasks", [])
+        found = False
+        for t in tasks:
+            if t.get("id") == task_id:
+                t["status"] = new_status
+                t["completed_at"] = datetime.utcnow().isoformat() if new_status == "completed" else None
+                found = True
+                break
+        if not found:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        audit_data["seo_tasks"] = tasks
+        row.results_json = json.dumps(audit_data, default=str)
+        db.commit()
+        return {"ok": True, "task_id": task_id, "status": new_status}
     finally:
         db.close()
 

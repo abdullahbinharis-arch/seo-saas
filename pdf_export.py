@@ -1,6 +1,13 @@
 """
 pdf_export.py — Generate a branded PDF report from a completed SEO audit.
 
+Layout (v3):
+  Page 1:   Cover — business name, URL, date, overall score
+  Page 2:   Score Overview — overall score (large) + 4 pillar scores
+  Page 3-4: Top 10 Quick Wins
+  Page 5-8: One page per pillar with improvement steps
+  Last:     CTA — upgrade prompt
+
 Usage:
     from pdf_export import build_pdf
     pdf_bytes = build_pdf(audit_dict)
@@ -23,21 +30,18 @@ _REPLACEMENTS = {
     "\u2013": "-",     # en dash
     "\u2014": "--",    # em dash
     "\u2022": "*",     # bullet
-    "\u00b7": ".",     # middle dot (already Latin-1 but keep for safety)
-    "\u00e9": "e",     # é
+    "\u00b7": ".",     # middle dot
+    "\u00e9": "e",     # e-acute
     "\u2192": "->",    # arrow
 }
 
 def _s(text) -> str:
-    """Return a Latin-1-safe, single-line string for fpdf cell() calls."""
+    """Latin-1-safe, single-line string for cell()."""
     t = str(text)
     for char, repl in _REPLACEMENTS.items():
         t = t.replace(char, repl)
-    # Collapse newlines / tabs to a space so cell() doesn't choke
     t = t.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    # Final pass: drop anything still outside Latin-1
     return t.encode("latin-1", errors="replace").decode("latin-1")
-
 
 def _ms(text) -> str:
     """Latin-1-safe string that preserves newlines for multi_cell()."""
@@ -48,22 +52,50 @@ def _ms(text) -> str:
     return t.encode("latin-1", errors="replace").decode("latin-1")
 
 # ---------------------------------------------------------------------------
-# Colour palette
+# Colour palette (dark-themed brand colours mapped to print)
 # ---------------------------------------------------------------------------
-NAVY       = (15,  23,  42)   # headings / cover
-BLUE       = (37,  99, 235)   # section titles
-LIGHT_BLUE = (219, 234, 254)  # section title bg
-GRAY_BG    = (248, 250, 252)  # table row bg
-GRAY_LINE  = (226, 232, 240)  # dividers
-GRAY_TEXT  = (100, 116, 139)  # secondary text
-GREEN      = (22, 163,  74)   # pass
-AMBER      = (217, 119,   6)  # warn
-RED        = (220,  38,  38)  # fail
+NAVY       = (15,  23,  42)
+DARK       = (24,  24,  27)   # card bg (#18181b)
+EMERALD    = (16, 185, 129)
+BLUE       = (59, 130, 246)
+AMBER      = (245, 158,  11)
+ROSE       = (244,  63,  62)
+VIOLET     = (139,  92, 246)
+LIGHT_BLUE = (219, 234, 254)
+GRAY_BG    = (248, 250, 252)
+GRAY_LINE  = (226, 232, 240)
+GRAY_TEXT  = (100, 116, 139)
+GREEN      = (22, 163,  74)
+RED        = (220,  38,  38)
 WHITE      = (255, 255, 255)
 
+# Score colour helper
+def _score_color(score: int) -> tuple:
+    if score >= 70: return EMERALD
+    if score >= 40: return AMBER
+    return ROSE
+
+def _score_label(score: int) -> str:
+    if score >= 70: return "Good"
+    if score >= 40: return "Needs Work"
+    return "Critical"
+
+def _priority_color(priority: str) -> tuple:
+    if priority == "high": return ROSE
+    if priority == "medium": return AMBER
+    return EMERALD
+
+# Pillar display names
+_PILLAR_LABELS = {
+    "website_seo": "Website SEO",
+    "backlinks": "Backlinks",
+    "local_seo": "Local SEO",
+    "ai_seo": "AI SEO",
+}
+
 
 # ---------------------------------------------------------------------------
-# PDF subclass with helpers
+# PDF subclass
 # ---------------------------------------------------------------------------
 
 class SEOReport(FPDF):
@@ -73,15 +105,13 @@ class SEOReport(FPDF):
         self.set_margins(18, 18, 18)
         self.set_auto_page_break(auto=True, margin=22)
 
-    # ── Header / footer ────────────────────────────────────────────────────
-
     def header(self):
-        if self.page_no() == 1:
+        if self.page_no() <= 1:
             return
         self.set_font("Helvetica", "B", 8)
         self.set_text_color(*GRAY_TEXT)
-        self.cell(0, 6, _s(f"SEO Audit Report  |  {self.audit.get('target_url', '')}"),
-                  align="L")
+        biz = self.audit.get("business_name") or self.audit.get("target_url", "")
+        self.cell(0, 6, _s(f"LocalRank SEO Report  |  {biz}"), align="L")
         self.ln(1)
         self.set_draw_color(*GRAY_LINE)
         self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
@@ -93,19 +123,21 @@ class SEOReport(FPDF):
         self.set_text_color(*GRAY_TEXT)
         self.cell(0, 6, f"Page {self.page_no()} of {{nb}}", align="C")
 
-    # ── Low-level drawing primitives ────────────────────────────────────────
+    # ── Drawing helpers ───────────────────────────────────────────────
 
     def rule(self):
         self.set_draw_color(*GRAY_LINE)
         self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(3)
 
-    def section_title(self, tag: str, title: str):
-        self.ln(4)
-        self.set_fill_color(*LIGHT_BLUE)
-        self.set_text_color(*BLUE)
-        self.set_font("Helvetica", "B", 12)
-        self.cell(0, 9, _s(f"  [{tag}]  {title}"), fill=True, ln=True)
+    def section_title(self, title: str, color=EMERALD):
+        self.ln(2)
+        self.set_fill_color(*color)
+        self.rect(self.l_margin, self.get_y(), 3, 9, "F")
+        self.set_font("Helvetica", "B", 13)
+        self.set_text_color(*NAVY)
+        self.set_x(self.l_margin + 6)
+        self.cell(0, 9, _s(title), ln=True)
         self.ln(3)
 
     def sub_heading(self, text: str):
@@ -114,57 +146,18 @@ class SEOReport(FPDF):
         self.cell(0, 6, _s(text), ln=True)
         self.ln(1)
 
-    def body(self, text: str, indent: int = 0):
+    def body(self, text: str):
         self.set_font("Helvetica", "", 9)
         self.set_text_color(*NAVY)
-        if indent:
-            self.set_x(self.l_margin + indent)
-        self.multi_cell(0, 5, _s(text))
-        self.set_x(self.l_margin)
+        self.multi_cell(0, 5, _ms(text))
 
     def small(self, text: str):
         self.set_font("Helvetica", "", 8)
         self.set_text_color(*GRAY_TEXT)
-        self.multi_cell(0, 5, _s(text))
-        self.set_x(self.l_margin)
-
-    def bullet(self, text: str, color=NAVY, indent: int = 4):
-        self.set_font("Helvetica", "", 9)
-        self.set_text_color(*color)
-        x = self.l_margin + indent
-        self.set_x(x)
-        self.set_font("Helvetica", "B", 9)
-        self.cell(4, 5, "-")
-        self.set_font("Helvetica", "", 9)
-        self.multi_cell(self.w - self.r_margin - x - 4, 5, _s(text))
-        self.set_x(self.l_margin)
-
-    def numbered(self, n: int, text: str):
-        self.set_font("Helvetica", "", 9)
-        self.set_text_color(*NAVY)
-        self.set_x(self.l_margin + 4)
-        self.cell(6, 5, f"{n}.")
-        self.multi_cell(self.w - self.r_margin - self.l_margin - 10, 5, _s(text))
-        self.set_x(self.l_margin)
-
-    def status_badge(self, status: str):
-        """Inline coloured badge: pass / warn / fail."""
-        s = (status or "").lower()
-        if s == "pass":
-            color, label = GREEN, "PASS"
-        elif s == "warn":
-            color, label = AMBER, "WARN"
-        else:
-            color, label = RED, "FAIL"
-        self.set_font("Helvetica", "B", 7)
-        self.set_text_color(*WHITE)
-        self.set_fill_color(*color)
-        self.cell(12, 4, label, fill=True, align="C")
-        self.set_text_color(*NAVY)
-        self.set_fill_color(*WHITE)
+        self.multi_cell(0, 5, _ms(text))
 
     def kv(self, key: str, value: str):
-        """Key: value line."""
+        self.set_x(self.l_margin)
         self.set_font("Helvetica", "B", 9)
         self.set_text_color(*GRAY_TEXT)
         self.cell(40, 5, _s(f"{key}:"))
@@ -173,99 +166,131 @@ class SEOReport(FPDF):
         self.multi_cell(0, 5, _s(value))
         self.set_x(self.l_margin)
 
-    def meta_box(self, label: str, value: str):
-        """Left-stripe coloured box for meta recommendations."""
-        self.set_font("Helvetica", "B", 7)
-        self.set_text_color(*GRAY_TEXT)
-        self.cell(0, 5, _s(label.upper()), ln=True)
-        y = self.get_y()
-        x = self.l_margin
-        w = self.w - self.l_margin - self.r_margin
-        self.set_fill_color(*BLUE)
-        self.rect(x, y, 2, 10, "F")
+    def score_box(self, score: int, label: str, x: float, y: float, w: float, h: float):
+        """Draw a score card with coloured score number."""
+        color = _score_color(score)
+        # Card background
         self.set_fill_color(*GRAY_BG)
-        self.rect(x + 2, y, w - 2, 10, "F")
-        self.set_xy(x + 5, y + 1)
+        self.rect(x, y, w, h, "F")
+        self.set_draw_color(*GRAY_LINE)
+        self.rect(x, y, w, h, "D")
+        # Score number
+        self.set_font("Helvetica", "B", 22)
+        self.set_text_color(*color)
+        self.set_xy(x, y + 4)
+        self.cell(w, 12, str(score), align="C")
+        # "/100" suffix
         self.set_font("Helvetica", "", 8)
+        self.set_text_color(*GRAY_TEXT)
+        self.set_xy(x, y + 15)
+        self.cell(w, 5, "/100", align="C")
+        # Label
+        self.set_font("Helvetica", "B", 7)
         self.set_text_color(*NAVY)
-        self.multi_cell(w - 7, 4.5, _s(value))
-        self.set_x(self.l_margin)
-        self.ln(2)
+        self.set_xy(x, y + 21)
+        self.cell(w, 5, _s(label), align="C")
+        # Status text
+        self.set_font("Helvetica", "", 7)
+        self.set_text_color(*color)
+        self.set_xy(x, y + 26)
+        self.cell(w, 5, _score_label(score), align="C")
 
-    def score_circle(self, score: int, label: str = "Technical Score"):
-        """Large score indicator."""
-        cx = self.l_margin + 18
-        cy = self.get_y() + 12
-        c = GREEN if score >= 8 else AMBER if score >= 5 else RED
-        self.set_fill_color(*c)
-        self.ellipse(cx - 12, cy - 10, 24, 20, "F")
-        self.set_font("Helvetica", "B", 14)
+    def priority_badge(self, priority: str):
+        color = _priority_color(priority)
+        label = priority.capitalize() if priority != "low" else "Growth"
+        self.set_font("Helvetica", "B", 7)
         self.set_text_color(*WHITE)
-        self.set_xy(cx - 12, cy - 5)
-        self.cell(24, 10, str(score), align="C")
-        self.set_font("Helvetica", "", 8)
-        self.set_text_color(*GRAY_TEXT)
-        self.set_xy(cx + 15, cy - 3)
-        self.cell(0, 5, _s(f"/ 10  {label}"))
-        self.set_xy(self.l_margin, cy + 14)
-
-    def tech_check_row(self, label: str, status: str, detail: str):
-        y = self.get_y()
-        if int(y) % 2 == 0:
-            self.set_fill_color(*GRAY_BG)
-            self.rect(self.l_margin, y, self.w - self.l_margin - self.r_margin, 7, "F")
-        self.set_font("Helvetica", "B", 8)
+        self.set_fill_color(*color)
+        self.cell(14, 4, _s(label), fill=True, align="C")
         self.set_text_color(*NAVY)
-        self.cell(45, 7, _s(label))
-        self.status_badge(status)
-        self.set_font("Helvetica", "", 8)
+        self.set_fill_color(*WHITE)
+
+    def pillar_badge(self, pillar: str):
+        label = _PILLAR_LABELS.get(pillar, pillar)
+        self.set_font("Helvetica", "", 7)
         self.set_text_color(*GRAY_TEXT)
-        self.set_x(self.l_margin + 60)
-        self.multi_cell(0, 7, _s(detail)[:120])
-        self.set_x(self.l_margin)
+        self.set_fill_color(*GRAY_BG)
+        self.cell(len(label) * 3 + 6, 4, _s(label), fill=True, align="C")
+        self.set_fill_color(*WHITE)
 
 
 # ---------------------------------------------------------------------------
-# Section renderers
+# Page renderers
 # ---------------------------------------------------------------------------
 
 def _cover(pdf: SEOReport):
+    """Page 1: Cover with business name, URL, date, overall score."""
     pdf.add_page()
+    a = pdf.audit
 
     # Dark banner
     pdf.set_fill_color(*NAVY)
-    pdf.rect(0, 0, pdf.w, 68, "F")
+    pdf.rect(0, 0, pdf.w, 75, "F")
 
-    pdf.set_xy(18, 18)
-    pdf.set_font("Helvetica", "B", 22)
-    pdf.set_text_color(*WHITE)
-    pdf.cell(0, 10, "SEO Audit Report", ln=True)
+    # Emerald accent bar
+    pdf.set_fill_color(*EMERALD)
+    pdf.rect(0, 75, pdf.w, 3, "F")
 
+    # Brand
+    pdf.set_xy(18, 14)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(*EMERALD)
+    pdf.cell(0, 6, "LOCALRANK", ln=True)
+
+    # Title
     pdf.set_x(18)
-    pdf.set_font("Helvetica", "", 11)
+    pdf.set_font("Helvetica", "B", 24)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 12, "SEO Audit Report", ln=True)
+
+    # Business name
+    biz = a.get("business_name", "")
+    if biz:
+        pdf.set_x(18)
+        pdf.set_font("Helvetica", "", 13)
+        pdf.set_text_color(148, 163, 184)
+        pdf.cell(0, 8, _s(biz), ln=True)
+
+    # URL
+    pdf.set_x(18)
+    pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(148, 163, 184)
-    url = _s(pdf.audit.get("target_url", ""))
-    pdf.cell(0, 8, url, ln=True)
+    pdf.cell(0, 7, _s(a.get("target_url", "")), ln=True)
 
-    pdf.set_xy(18, 72)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(*GRAY_TEXT)
+    # Overall score in top-right of banner
+    scores = a.get("scores", {})
+    overall = scores.get("overall", 0)
+    if overall:
+        color = _score_color(overall)
+        # Circle
+        cx, cy = pdf.w - 45, 38
+        pdf.set_fill_color(*color)
+        pdf.ellipse(cx - 18, cy - 18, 36, 36, "F")
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(*WHITE)
+        pdf.set_xy(cx - 18, cy - 7)
+        pdf.cell(36, 14, str(overall), align="C")
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_xy(cx - 18, cy + 7)
+        pdf.cell(36, 5, "/ 100", align="C")
 
-    ts = pdf.audit.get("timestamp", "")
+    # Meta section
+    pdf.set_xy(18, 84)
+
+    ts = a.get("timestamp", "")
     try:
         dt = datetime.fromisoformat(ts)
         date_str = dt.strftime("%B %d, %Y")
     except Exception:
-        date_str = ts[:10]
+        date_str = ts[:10] if ts else "N/A"
 
     meta_items = [
-        ("Keyword",   pdf.audit.get("keyword", "")),
-        ("Location",  pdf.audit.get("location", "")),
+        ("Keyword",   a.get("keyword", "")),
+        ("Location",  a.get("location", "")),
         ("Date",      date_str),
-        ("Agents",    str(pdf.audit.get("agents_executed", 4))),
-        ("Time",      f"{pdf.audit.get('execution_time_seconds', 0)}s"),
-        ("Est. cost", f"${pdf.audit.get('summary', {}).get('estimated_api_cost', 0):.3f}"),
-        ("Audit ID",  pdf.audit.get("audit_id", "")[:16] + "..."),
+        ("Agents",    str(a.get("agents_executed", 11))),
+        ("Time",      f"{a.get('execution_time_seconds', 0):.0f}s"),
+        ("Est. cost", f"${a.get('estimated_cost', a.get('summary', {}).get('estimated_api_cost', 0)):.3f}"),
     ]
     for key, val in meta_items:
         pdf.set_font("Helvetica", "B", 9)
@@ -275,358 +300,368 @@ def _cover(pdf: SEOReport):
         pdf.set_text_color(*NAVY)
         pdf.cell(0, 6, _s(str(val)), ln=True)
 
-    pdf.ln(6)
+    pdf.ln(4)
     pdf.rule()
 
 
-def _quick_wins(pdf: SEOReport):
-    wins = pdf.audit.get("summary", {}).get("quick_wins", [])
-    if not wins:
-        return
-    pdf.section_title("!", "Quick Wins")
-    for i, win in enumerate(wins, 1):
-        pdf.numbered(i, win)
-        pdf.ln(1)
-    pdf.ln(2)
-
-
-def _keyword_research(pdf: SEOReport):
-    agent = pdf.audit.get("agents", {}).get("keyword_research", {})
-    rec   = agent.get("recommendations", {})
-    if not rec:
+def _score_overview(pdf: SEOReport):
+    """Page 2: Overall score (large, centred) + 4 pillar score cards."""
+    a = pdf.audit
+    scores = a.get("scores", {})
+    if not scores:
         return
 
     pdf.add_page()
-    pdf.section_title("KW", "Keyword Research")
-    pdf.kv("Primary keyword",       rec.get("primary_keyword", ""))
-    pdf.kv("Competitors analysed",  str(agent.get("competitors_analyzed", "")))
+    pdf.section_title("Score Overview", EMERALD)
+
+    overall = scores.get("overall", 0)
+    color = _score_color(overall)
+
+    # Large centred overall score
+    cx = pdf.w / 2
+    cy = pdf.get_y() + 25
+    # Outer ring
+    pdf.set_draw_color(*color)
+    pdf.set_line_width(2)
+    pdf.ellipse(cx - 22, cy - 22, 44, 44, "D")
+    pdf.set_line_width(0.2)
+    # Score text
+    pdf.set_font("Helvetica", "B", 28)
+    pdf.set_text_color(*color)
+    pdf.set_xy(cx - 22, cy - 10)
+    pdf.cell(44, 18, str(overall), align="C")
+    # "/100" below
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*GRAY_TEXT)
+    pdf.set_xy(cx - 22, cy + 6)
+    pdf.cell(44, 6, "/100", align="C")
+    # Label
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(*NAVY)
+    pdf.set_xy(cx - 50, cy + 16)
+    pdf.cell(100, 7, "Overall LocalRank Score", align="C")
+    # Status
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*color)
+    pdf.set_xy(cx - 50, cy + 23)
+    pdf.cell(100, 6, _score_label(overall), align="C")
+
+    pdf.set_y(cy + 38)
+
+    # 4 pillar cards in a row
+    pillars = ["website_seo", "backlinks", "local_seo", "ai_seo"]
+    card_w = 40
+    gap = 5
+    total_w = len(pillars) * card_w + (len(pillars) - 1) * gap
+    start_x = (pdf.w - total_w) / 2
+    card_y = pdf.get_y()
+
+    for i, key in enumerate(pillars):
+        score = scores.get(key, 0)
+        label = _PILLAR_LABELS.get(key, key)
+        x = start_x + i * (card_w + gap)
+        pdf.score_box(score, label, x, card_y, card_w, 34)
+
+    pdf.set_y(card_y + 40)
+
+    # Score details
+    details = a.get("score_details", {})
+    if details:
+        pdf.ln(4)
+        pdf.sub_heading("Score Breakdown")
+
+        ws = details.get("website_seo", {})
+        if ws:
+            pdf.kv("Page Speed", f"{ws.get('page_speed', 0)}/100")
+            pdf.kv("On-Page", f"{ws.get('on_page', 0)}/100")
+            pdf.kv("Technical", f"{ws.get('technical', 0)}/100")
+            pdf.kv("Issues Found", str(ws.get("issues_count", 0)))
+            pdf.ln(2)
+
+        bl = details.get("backlinks", {})
+        if bl:
+            pdf.kv("Estimated DA", str(bl.get("estimated_da", 0)))
+            pdf.kv("Est. Backlinks", str(bl.get("estimated_backlinks", 0)))
+            pdf.kv("Competitors Avg DA", str(bl.get("competitors_avg_da", 0)))
+            pdf.ln(2)
+
+        ls = details.get("local_seo", {})
+        if ls:
+            pdf.kv("GBP Status", str(ls.get("gbp_status", "unknown")))
+            pdf.kv("Citations", f"{ls.get('citations_found', 0)} / {ls.get('citations_needed', 0)}")
+            pdf.kv("Reviews", str(ls.get("review_count", 0)))
+            pdf.ln(2)
+
+        ai = details.get("ai_seo", {})
+        if ai:
+            pdf.kv("FAQ Schema", "Yes" if ai.get("faq_schema") else "No")
+            pdf.kv("E-E-A-T Signals", "Yes" if ai.get("eeat_signals") else "No")
+            pdf.kv("Content Depth", str(ai.get("content_depth", "unknown")))
+
+
+def _quick_wins(pdf: SEOReport):
+    """Pages 3-4: Top 10 Quick Wins."""
+    # Try new structured quick_wins first, fall back to summary
+    wins = pdf.audit.get("quick_wins", [])
+    if not wins:
+        old_wins = pdf.audit.get("summary", {}).get("quick_wins", [])
+        if not old_wins:
+            return
+        # Render old-style string wins
+        pdf.add_page()
+        pdf.section_title("Top Quick Wins", EMERALD)
+        for i, w in enumerate(old_wins, 1):
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*NAVY)
+            pdf.cell(8, 6, f"{i}.")
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 6, _s(w))
+            pdf.ln(1)
+        return
+
+    pdf.add_page()
+    pdf.section_title("Top 10 Quick Wins", EMERALD)
+    pdf.small("Highest-impact actions sorted by expected ranking improvement. Do these first.")
     pdf.ln(3)
 
-    # High-intent keywords table
-    keywords = rec.get("high_intent_keywords", [])
-    if keywords:
-        pdf.sub_heading("High-Intent Keywords")
-        col_w = [80, 30, 38, 26]
-        headers = ["Keyword", "Intent", "Searches/mo", "Difficulty"]
-        # header row
-        pdf.set_fill_color(*NAVY)
-        pdf.set_text_color(*WHITE)
-        pdf.set_font("Helvetica", "B", 8)
-        for i, h in enumerate(headers):
-            pdf.cell(col_w[i], 6, h, fill=True, border=0)
-        pdf.ln()
-        # data rows
-        for j, kw in enumerate(keywords[:12]):
-            bg = GRAY_BG if j % 2 == 0 else WHITE
-            pdf.set_fill_color(*bg)
-            pdf.set_text_color(*NAVY)
-            pdf.set_font("Helvetica", "", 8)
-            pdf.cell(col_w[0], 6, _s(str(kw.get("keyword", ""))[:40]), fill=True)
-            pdf.cell(col_w[1], 6, _s(str(kw.get("intent", ""))), fill=True)
-            pdf.cell(col_w[2], 6,
-                     f"{kw.get('estimated_monthly_searches', 0):,}", fill=True)
-            diff  = str(kw.get("difficulty", "")).lower()
-            color = GREEN if diff == "low" else AMBER if diff == "medium" else RED
-            pdf.set_text_color(*color)
-            pdf.cell(col_w[3], 6, _s(diff.capitalize()), fill=True)
-            pdf.set_text_color(*NAVY)
-            pdf.ln()
-        pdf.ln(3)
+    for win in wins:
+        rank = win.get("rank", 0)
+        title = win.get("title", "")
+        desc = win.get("description", "")
+        pillar = win.get("pillar", "")
+        priority = win.get("priority", "medium")
+        impact = win.get("impact", "")
+        time_est = win.get("time_estimate", "")
 
-    # Long-tail
-    long_tail = rec.get("long_tail_keywords", [])
-    if long_tail:
-        pdf.sub_heading("Long-Tail Opportunities")
-        for lt in long_tail[:8]:
-            pdf.bullet(lt, color=BLUE)
-        pdf.ln(2)
+        # Check if we need a new page (leave room for at least 25mm)
+        if pdf.get_y() > pdf.h - 40:
+            pdf.add_page()
 
-    # Competitor gaps
-    gaps = rec.get("competitor_keywords_we_miss", [])
-    if gaps:
-        pdf.sub_heading("Competitor Keyword Gaps")
-        for g in gaps:
-            pdf.bullet(g, color=AMBER)
-        pdf.ln(2)
+        # Rank number
+        p_color = _priority_color(priority)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(*p_color)
+        y_start = pdf.get_y()
+        pdf.cell(8, 6, str(rank))
 
-    # Clusters
-    clusters = rec.get("keyword_clusters", [])
-    if clusters:
-        pdf.sub_heading("Keyword Clusters")
-        for c in clusters[:5]:
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*NAVY)
-            pdf.cell(0, 5, _s(c.get("theme", "")), ln=True)
+        # Title
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(*NAVY)
+        x_body = pdf.l_margin + 10
+        pdf.set_x(x_body)
+        pdf.multi_cell(pdf.w - pdf.r_margin - x_body, 5, _s(title))
+
+        # Description
+        if desc:
+            pdf.set_x(x_body)
             pdf.set_font("Helvetica", "", 8)
             pdf.set_text_color(*GRAY_TEXT)
-            pdf.set_x(pdf.l_margin + 6)
-            pdf.multi_cell(0, 4.5, _s(" / ".join(c.get("keywords", []))))
-            pdf.set_x(pdf.l_margin)
-            pdf.ln(1)
-        pdf.ln(2)
+            pdf.multi_cell(pdf.w - pdf.r_margin - x_body, 4.5, _s(desc[:200]))
 
-    # Strategy note
-    strategy = rec.get("recommendation", "")
-    if strategy:
-        pdf.sub_heading("Strategy")
-        pdf.set_fill_color(*LIGHT_BLUE)
+        # Meta line: impact + time
+        if impact or time_est:
+            pdf.set_x(x_body)
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_text_color(*GRAY_TEXT)
+            meta_parts = []
+            if impact:
+                meta_parts.append(impact)
+            if time_est:
+                meta_parts.append(time_est)
+            pdf.cell(0, 4, _s(" | ".join(meta_parts)), ln=True)
+
+        # Priority + pillar badges
+        pdf.set_x(x_body)
+        pdf.priority_badge(priority)
+        pdf.cell(2, 4, "")
+        pdf.pillar_badge(pillar)
+        pdf.ln(4)
+
+        # Divider
+        pdf.set_draw_color(*GRAY_LINE)
+        pdf.line(pdf.l_margin + 10, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+        pdf.ln(3)
+
+
+def _pillar_page(pdf: SEOReport, pillar_key: str, color: tuple):
+    """One page per pillar with score header + improvement steps."""
+    pillars = pdf.audit.get("pillars", {})
+    pillar = pillars.get(pillar_key)
+    if not pillar:
+        return
+
+    pdf.add_page()
+
+    score = pillar.get("score", 0)
+    title = pillar.get("title", _PILLAR_LABELS.get(pillar_key, pillar_key))
+    subtitle = pillar.get("subtitle", "")
+    steps = pillar.get("steps", [])
+
+    # Pillar header with colour stripe
+    pdf.set_fill_color(*color)
+    pdf.rect(pdf.l_margin, pdf.get_y(), 3, 12, "F")
+    pdf.set_x(pdf.l_margin + 6)
+
+    # Title + score on same line
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_text_color(*NAVY)
+    pdf.cell(100, 7, _s(title))
+
+    # Score right-aligned
+    s_color = _score_color(score)
+    pdf.set_font("Helvetica", "B", 22)
+    pdf.set_text_color(*s_color)
+    pdf.cell(0, 7, f"{score}/100", align="R", ln=True)
+
+    # Subtitle
+    if subtitle:
+        pdf.set_x(pdf.l_margin + 6)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(*GRAY_TEXT)
+        pdf.cell(0, 5, _s(subtitle), ln=True)
+
+    pdf.ln(6)
+
+    # Improvement steps
+    pdf.sub_heading("Improvement Steps")
+
+    for step in steps:
+        rank = step.get("rank", 0)
+        s_title = step.get("title", "")
+        s_desc = step.get("description", "")
+        s_cat = step.get("category", "")
+        s_priority = step.get("priority", "medium")
+        s_time = step.get("time_estimate", "")
+
+        if pdf.get_y() > pdf.h - 35:
+            pdf.add_page()
+
+        # Step number
+        p_color = _priority_color(s_priority)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(*p_color)
+        pdf.cell(8, 6, str(rank))
+
+        # Step title
+        x_body = pdf.l_margin + 10
+        pdf.set_x(x_body)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(*NAVY)
+        pdf.multi_cell(pdf.w - pdf.r_margin - x_body, 5, _s(s_title))
+
+        # Description
+        if s_desc:
+            pdf.set_x(x_body)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(*GRAY_TEXT)
+            pdf.multi_cell(pdf.w - pdf.r_margin - x_body, 4.5, _ms(s_desc[:300]))
+
+        # Tags line
+        pdf.set_x(x_body)
+        if s_cat:
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_text_color(*GRAY_TEXT)
+            pdf.set_fill_color(*GRAY_BG)
+            pdf.cell(len(s_cat) * 3 + 6, 4, _s(s_cat), fill=True, align="C")
+            pdf.cell(2, 4, "")
+        pdf.priority_badge(s_priority)
+        if s_time:
+            pdf.cell(2, 4, "")
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_text_color(*GRAY_TEXT)
+            pdf.set_fill_color(*GRAY_BG)
+            pdf.cell(len(s_time) * 3 + 6, 4, _s(s_time), fill=True, align="C")
+            pdf.set_fill_color(*WHITE)
+        pdf.ln(4)
+
+        # Divider
+        pdf.set_draw_color(*GRAY_LINE)
+        pdf.line(x_body, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+        pdf.ln(3)
+
+
+def _cta_page(pdf: SEOReport):
+    """Last page: CTA to upgrade."""
+    pdf.add_page()
+
+    # Centred content
+    pdf.ln(30)
+
+    # Brand
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(*EMERALD)
+    pdf.cell(0, 7, "LOCALRANK", align="C", ln=True)
+
+    # Headline
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(*NAVY)
+    pdf.cell(0, 10, "Track your SEO progress", align="C", ln=True)
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(*GRAY_TEXT)
+    pdf.cell(0, 7, "Turn this report into a living action plan", align="C", ln=True)
+
+    pdf.ln(10)
+
+    # Feature comparison table
+    col_w = 58
+    start_x = (pdf.w - col_w * 3) / 2
+    headers = ["", "Free", "Pro"]
+    features = [
+        ("PDF Report", "Yes", "Yes"),
+        ("Score Dashboard", "-", "Yes"),
+        ("Task Tracking", "-", "Yes"),
+        ("AI Content Tools", "-", "Yes"),
+        ("Monthly Re-audits", "-", "Yes"),
+        ("Priority Support", "-", "Yes"),
+    ]
+
+    y = pdf.get_y()
+    # Header row
+    pdf.set_fill_color(*NAVY)
+    pdf.set_text_color(*WHITE)
+    pdf.set_font("Helvetica", "B", 9)
+    for i, h in enumerate(headers):
+        pdf.set_xy(start_x + i * col_w, y)
+        pdf.cell(col_w, 7, h, fill=True, align="C")
+    pdf.ln(7)
+
+    # Feature rows
+    for j, (feat, free, pro) in enumerate(features):
+        bg = GRAY_BG if j % 2 == 0 else WHITE
+        pdf.set_fill_color(*bg)
+        row_y = pdf.get_y()
+
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(*NAVY)
-        pdf.multi_cell(0, 5, _ms(strategy), border=0)
-        pdf.ln(2)
+        pdf.set_xy(start_x, row_y)
+        pdf.cell(col_w, 6, _s(f"  {feat}"), fill=True)
 
+        pdf.set_text_color(*GRAY_TEXT)
+        pdf.set_xy(start_x + col_w, row_y)
+        pdf.cell(col_w, 6, free, fill=True, align="C")
 
-def _on_page_seo(pdf: SEOReport):
-    agent = pdf.audit.get("agents", {}).get("on_page_seo", {})
-    rec   = agent.get("recommendations", {})
-    if not rec:
-        return
+        pdf.set_text_color(*EMERALD)
+        pdf.set_xy(start_x + 2 * col_w, row_y)
+        pdf.cell(col_w, 6, pro, fill=True, align="C")
+        pdf.ln(6)
 
-    pdf.add_page()
-    pdf.section_title("ON", "On-Page SEO")
+    pdf.ln(8)
 
-    current = rec.get("current_analysis", {})
-    recs    = rec.get("recommendations", {})
+    # CTA button
+    btn_w = 60
+    btn_x = (pdf.w - btn_w) / 2
+    pdf.set_fill_color(*EMERALD)
+    pdf.rect(btn_x, pdf.get_y(), btn_w, 10, "F")
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(*WHITE)
+    pdf.set_xy(btn_x, pdf.get_y())
+    pdf.cell(btn_w, 10, "Upgrade to Pro", align="C")
+    pdf.ln(14)
 
-    # Score badge inline
-    score = current.get("seo_score", 0)
-    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(*GRAY_TEXT)
-    pdf.cell(30, 6, "SEO Score:")
-    s_color = GREEN if score >= 7 else AMBER if score >= 4 else RED
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.set_text_color(*s_color)
-    pdf.cell(0, 6, f"{score} / 10", ln=True)
-    pdf.ln(1)
-
-    # Current state
-    pdf.sub_heading("Current Page State")
-    pdf.kv("Title tag",    current.get("title", "N/A"))
-    pdf.kv("Meta desc",    current.get("meta_description", "N/A"))
-    pdf.kv("H1",           current.get("h1", "N/A"))
-    pdf.kv("Word count",   str(current.get("word_count", 0)))
-    pdf.ln(2)
-
-    issues = current.get("issues_found", [])
-    if issues:
-        pdf.sub_heading("Issues Found")
-        for issue in issues:
-            pdf.bullet(issue, color=RED)
-        pdf.ln(2)
-
-    # Recommendations
-    if recs:
-        pdf.sub_heading("Recommended Tags")
-        if recs.get("meta_title"):
-            pdf.meta_box("Title Tag", recs["meta_title"])
-        if recs.get("meta_description"):
-            pdf.meta_box("Meta Description", recs["meta_description"])
-        if recs.get("h1"):
-            pdf.meta_box("H1 Heading", recs["h1"])
-        if recs.get("target_word_count"):
-            pdf.kv("Target word count", f"{recs['target_word_count']:,} words "
-                   f"(currently {current.get('word_count', 0):,})")
-        pdf.ln(2)
-
-    # Priority actions
-    actions = rec.get("priority_actions", [])
-    if actions:
-        pdf.sub_heading("Priority Actions")
-        for i, action in enumerate(actions, 1):
-            pdf.numbered(i, action)
-            pdf.ln(1)
-        pdf.ln(2)
-
-    # Internal links
-    links = rec.get("internal_links", [])
-    if links:
-        pdf.sub_heading("Internal Links to Add")
-        for link in links[:5]:
-            anchor = link.get("anchor_text", "")
-            path   = link.get("target_path", "")
-            reason = link.get("reason", "")
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*BLUE)
-            pdf.cell(0, 5, _s(f'"{anchor}"  ->  {path}'), ln=True)
-            pdf.small(reason)
-            pdf.ln(1)
-        pdf.ln(2)
-
-
-def _local_seo(pdf: SEOReport):
-    agent = pdf.audit.get("agents", {}).get("local_seo", {})
-    rec   = agent.get("recommendations", {})
-    if not rec:
-        return
-
-    pdf.add_page()
-    pdf.section_title("LO", "Local SEO")
-
-    # Quick wins
-    qw = rec.get("quick_wins", [])
-    if qw:
-        pdf.sub_heading("Quick Wins")
-        for w in qw:
-            pdf.bullet(w, color=GREEN)
-        pdf.ln(2)
-
-    # GBP
-    gbp = rec.get("gbp_optimization", {})
-    if gbp:
-        pdf.sub_heading("Google Business Profile")
-        attrs = gbp.get("priority_attributes", [])
-        cats  = gbp.get("categories", [])
-        if attrs:
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*GRAY_TEXT)
-            pdf.cell(0, 5, "Priority attributes:", ln=True)
-            pdf.body(" / ".join(attrs), indent=4)
-        if cats:
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*GRAY_TEXT)
-            pdf.cell(0, 5, "Categories:", ln=True)
-            pdf.body(" / ".join(cats), indent=4)
-        if gbp.get("photo_strategy"):
-            pdf.ln(1)
-            pdf.small(f"Photo strategy: {gbp['photo_strategy']}")
-        rs = gbp.get("review_strategy", {})
-        if rs.get("target_reviews_per_month"):
-            pdf.small(f"Review target: {rs['target_reviews_per_month']} reviews/month")
-        pdf.ln(2)
-
-    # Citations table
-    citations = rec.get("citations", [])
-    if citations:
-        pdf.sub_heading("Citations to Build")
-        col_w = [80, 52, 42]
-        pdf.set_fill_color(*NAVY)
-        pdf.set_text_color(*WHITE)
-        pdf.set_font("Helvetica", "B", 8)
-        for h, w in zip(["Directory", "Category", "Priority"], col_w):
-            pdf.cell(w, 6, h, fill=True)
-        pdf.ln()
-        for j, c in enumerate(citations[:10]):
-            bg = GRAY_BG if j % 2 == 0 else WHITE
-            pdf.set_fill_color(*bg)
-            pdf.set_font("Helvetica", "", 8)
-            pdf.set_text_color(*NAVY)
-            pdf.cell(col_w[0], 6, str(c.get("site", ""))[:35], fill=True)
-            pdf.cell(col_w[1], 6, str(c.get("category", "")), fill=True)
-            pri = str(c.get("priority", "")).lower()
-            p_color = RED if pri == "critical" else AMBER if pri == "high" else NAVY
-            pdf.set_text_color(*p_color)
-            pdf.cell(col_w[2], 6, pri.capitalize(), fill=True)
-            pdf.set_text_color(*NAVY)
-            pdf.ln()
-        pdf.ln(3)
-
-    # Link opportunities
-    opps = rec.get("link_opportunities", [])
-    if opps:
-        pdf.sub_heading("Link Building Opportunities")
-        for opp in opps[:5]:
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*NAVY)
-            name = opp.get("name", "")
-            ltype = opp.get("link_type", "")
-            pdf.cell(0, 5, f"{name}  [{ltype}]", ln=True)
-            pdf.small(opp.get("reason", ""))
-            template = opp.get("outreach_template", "")
-            if template:
-                pdf.set_font("Helvetica", "I", 7)
-                pdf.set_text_color(*GRAY_TEXT)
-                pdf.set_x(pdf.l_margin + 4)
-                pdf.multi_cell(0, 4, _s(f'"{template[:140]}"'))
-                pdf.set_x(pdf.l_margin)
-            pdf.ln(1)
-        pdf.ln(2)
-
-    # Content strategy
-    cs = rec.get("local_content_strategy", {})
-    topics = cs.get("blog_topics", [])
-    areas  = cs.get("service_area_pages", [])
-    if topics or areas:
-        pdf.sub_heading("Content Strategy")
-        if topics:
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*GRAY_TEXT)
-            pdf.cell(0, 5, "Blog topics:", ln=True)
-            for t in topics[:6]:
-                pdf.bullet(t)
-            pdf.ln(1)
-        if areas:
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*GRAY_TEXT)
-            pdf.cell(0, 5, "Service area pages:", ln=True)
-            pdf.body(" / ".join(areas), indent=4)
-        pdf.ln(2)
-
-    impact = rec.get("estimated_impact", "")
-    if impact:
-        pdf.set_fill_color(*LIGHT_BLUE)
-        pdf.set_font("Helvetica", "BI", 8)
-        pdf.set_text_color(*BLUE)
-        pdf.multi_cell(0, 5, _ms(f"Estimated impact: {impact}"))
-        pdf.ln(2)
-
-
-def _technical_seo(pdf: SEOReport):
-    agent = pdf.audit.get("agents", {}).get("technical_seo", {})
-    rec   = agent.get("recommendations", {})
-    if not rec:
-        return
-
-    pdf.add_page()
-    pdf.section_title("TX", "Technical SEO")
-
-    score = rec.get("technical_score", 0)
-    pdf.score_circle(score)
-    pdf.ln(2)
-
-    # Check table
-    checks = [
-        ("HTTPS",           rec.get("https",           {}).get("status"), rec.get("https",           {}).get("detail", "")),
-        ("Mobile viewport", rec.get("mobile",          {}).get("status"), rec.get("mobile",          {}).get("recommendation", "")),
-        ("Canonical",       rec.get("canonical",       {}).get("status"), rec.get("canonical",       {}).get("recommendation", "")),
-        ("Robots meta",     rec.get("robots",          {}).get("status"), rec.get("robots",          {}).get("recommendation", "")),
-        ("Structured data", rec.get("structured_data", {}).get("status"), rec.get("structured_data", {}).get("recommendation", "")),
-        ("Images / alt",    rec.get("images",          {}).get("status"), rec.get("images",          {}).get("recommendation", "")),
-        ("Page speed",      rec.get("page_speed",      {}).get("status"), rec.get("page_speed",      {}).get("recommendation", "")),
-    ]
-    pdf.sub_heading("Technical Checks")
-    for label, status, detail in checks:
-        pdf.tech_check_row(label, status or "warn", detail)
-    pdf.ln(3)
-
-    # Structured data detail
-    sd = rec.get("structured_data", {})
-    found  = sd.get("schemas_found", [])
-    to_add = sd.get("schemas_to_add", [])
-    if found or to_add:
-        pdf.sub_heading("Structured Data")
-        if found:
-            pdf.kv("Schemas found",  " / ".join(found))
-        if to_add:
-            pdf.kv("Schemas to add", " / ".join(to_add))
-        pdf.ln(2)
-
-    # Page speed detail
-    ps = rec.get("page_speed", {})
-    ps_issues = ps.get("issues", [])
-    if ps_issues:
-        pdf.sub_heading("Page Speed Issues")
-        for issue in ps_issues:
-            pdf.bullet(issue, color=RED)
-        pdf.ln(2)
-
-    # Priority fixes
-    fixes = rec.get("priority_fixes", [])
-    if fixes:
-        pdf.sub_heading("Priority Fixes")
-        for i, fix in enumerate(fixes, 1):
-            pdf.numbered(i, fix)
-            pdf.ln(1)
-        pdf.ln(2)
+    pdf.cell(0, 5, "localrank.com", align="C")
 
 
 # ---------------------------------------------------------------------------
@@ -641,11 +676,22 @@ def build_pdf(audit: dict) -> bytes:
     pdf = SEOReport(audit)
     pdf.alias_nb_pages()
 
+    # Page 1: Cover
     _cover(pdf)
+
+    # Page 2: Score overview
+    _score_overview(pdf)
+
+    # Pages 3-4: Quick wins
     _quick_wins(pdf)
-    _keyword_research(pdf)
-    _on_page_seo(pdf)
-    _local_seo(pdf)
-    _technical_seo(pdf)
+
+    # Pages 5-8: One page per pillar
+    _pillar_page(pdf, "website_seo", BLUE)
+    _pillar_page(pdf, "backlinks", ROSE)
+    _pillar_page(pdf, "local_seo", AMBER)
+    _pillar_page(pdf, "ai_seo", VIOLET)
+
+    # Last page: CTA
+    _cta_page(pdf)
 
     return bytes(pdf.output())
