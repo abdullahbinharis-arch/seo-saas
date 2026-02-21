@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**LocalRank — AI Local SEO Platform**
+**LocalRankr — AI Local SEO Platform**
 
 A FastAPI backend with 4 AI agents (Keyword Research, On-Page SEO, Local SEO, Technical SEO) that analyse local business websites and return actionable SEO recommendations. Includes JWT-based auth (email/password + Google OAuth), PDF report export, and a dark-themed Next.js frontend.
 
@@ -98,7 +98,7 @@ ALLOWED_ORIGINS=         # Comma-separated: https://yourdomain.vercel.app,...
 DATABASE_URL=            # PostgreSQL (Railway provides this automatically)
 CLAUDE_MODEL=claude-sonnet-4-6
 RESEND_API_KEY=          # Optional — email skipped if not set
-FROM_EMAIL=              # e.g. LocalRank <noreply@yourdomain.com>
+FROM_EMAIL=              # e.g. LocalRankr <noreply@localrankr.io>
 RATE_LIMIT_PER_MIN=10
 ```
 
@@ -177,7 +177,7 @@ curl -X POST http://localhost:8000/workflow/seo-audit \
 - [x] PostgreSQL audit history per user
 - [x] PDF report export (`/audits/{id}/export`)
 - [x] Email on audit complete (Resend, non-blocking)
-- [x] Dark glassmorphism UI (LocalRank brand)
+- [x] Dark glassmorphism UI (LocalRankr brand)
 - [x] Local SEO Score (0–100 composite)
 
 ### Planned — Rate Limiting Tiers

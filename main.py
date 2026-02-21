@@ -50,7 +50,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "LocalRank <reports@localrank.io>")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "LocalRankr <reports@localrankr.io>")
 MOZ_ACCESS_ID = os.getenv("MOZ_ACCESS_ID", "")
 MOZ_SECRET_KEY = os.getenv("MOZ_SECRET_KEY", "")
 
@@ -3501,7 +3501,7 @@ def _send_audit_email(to_email: str, report: dict) -> None:
         <tr><td style="background:#0f0f12;border:1px solid rgba(255,255,255,0.06);border-radius:16px 16px 0 0;padding:32px 40px;text-align:center;">
           <div style="display:inline-flex;align-items:center;gap:10px;margin-bottom:8px;">
             <div style="width:36px;height:36px;background:linear-gradient(135deg,#34d399,#059669);border-radius:10px;display:inline-block;vertical-align:middle;"></div>
-            <span style="font-size:20px;font-weight:700;color:#ffffff;vertical-align:middle;">LocalRank</span>
+            <span style="font-size:20px;font-weight:700;color:#ffffff;vertical-align:middle;">LocalRankr</span>
           </div>
           <p style="margin:8px 0 0;color:#71717a;font-size:14px;">Your Local SEO Audit Report is ready</p>
         </td></tr>
@@ -3528,7 +3528,7 @@ def _send_audit_email(to_email: str, report: dict) -> None:
         <tr><td style="background:#18181b;border:1px solid rgba(255,255,255,0.06);border-radius:0 0 16px 16px;padding:32px 40px;text-align:center;">
           <p style="margin:0 0 20px;color:#a1a1aa;font-size:14px;">Your full report includes keyword research, on-page fixes, citation opportunities, and a complete local SEO strategy.</p>
           <p style="margin:0 0 28px;color:#52525b;font-size:12px;">Audit ID: {audit_id[:8]}</p>
-          <p style="margin:24px 0 0;color:#52525b;font-size:11px;">LocalRank &mdash; AI-Powered Local SEO Platform</p>
+          <p style="margin:24px 0 0;color:#52525b;font-size:11px;">LocalRankr &mdash; AI-Powered Local SEO Platform</p>
         </td></tr>
 
       </table>
