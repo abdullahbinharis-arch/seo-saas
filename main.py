@@ -1688,86 +1688,87 @@ async def technical_seo_agent(request: AuditRequest, crawl_aggregate: dict | Non
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] Technical SEO starting for '{request.target_url}'")
 
-    # Fetch PageSpeed data and scrape signals concurrently
-    signals, psi = await asyncio.gather(
-        scrape_technical_signals(request.target_url),
-        fetch_pagespeed(request.target_url),
-    )
+    try:
+        # Fetch PageSpeed data and scrape signals concurrently
+        signals, psi = await asyncio.gather(
+            scrape_technical_signals(request.target_url),
+            fetch_pagespeed(request.target_url),
+        )
 
-    mob = psi.get("mobile", {})
-    desk = psi.get("desktop", {})
+        mob = psi.get("mobile") or {}
+        desk = psi.get("desktop") or {}
 
-    # Format top opportunities as a bullet list
-    opps = mob.get("opportunities") or desk.get("opportunities") or []
-    opp_lines = "\n".join(
-        f"  - {o['title']}: saves ~{o['savings_ms']}ms"
-        for o in opps
-    ) or "  - No opportunity data available"
+        # Format top opportunities as a bullet list
+        opps = mob.get("opportunities") or desk.get("opportunities") or []
+        opp_lines = "\n".join(
+            f"  - {o['title']}: saves ~{o['savings_ms']}ms"
+            for o in opps
+        ) or "  - No opportunity data available"
 
-    # New signal shorthands
-    redir = signals.get("redirect_chain", {})
-    og = signals.get("og_tags", {})
-    tw = signals.get("twitter_tags", {})
-    html_ratio = signals.get("html_text_ratio", {})
-    broken = signals.get("broken_links", {})
-    robots_txt = signals.get("robots_txt", {})
-    sitemap = signals.get("sitemap_xml", {})
-    broken_urls = ", ".join(b["url"] for b in broken.get("broken_links", [])[:5]) or "None"
+        # New signal shorthands — use `or {}` to handle None values
+        redir = signals.get("redirect_chain") or {}
+        og = signals.get("og_tags") or {}
+        tw = signals.get("twitter_tags") or {}
+        html_ratio = signals.get("html_text_ratio") or {}
+        broken = signals.get("broken_links") or {}
+        robots_txt = signals.get("robots_txt") or {}
+        sitemap = signals.get("sitemap_xml") or {}
+        broken_urls = ", ".join(str(b.get("url", "")) for b in broken.get("broken_links", [])[:5]) or "None"
 
-    prompt = TECHNICAL_PROMPT.format(
-        business_name=request.business_name or "this business",
-        business_type=request.business_type or "local business",
-        target_url=request.target_url,
-        keyword=request.keyword,
-        # PageSpeed
-        psi_mobile_score=mob.get("performance_score", "N/A"),
-        psi_desktop_score=desk.get("performance_score", "N/A"),
-        psi_mobile_lcp=mob.get("lcp", "N/A"),
-        psi_mobile_inp=mob.get("inp", "N/A"),
-        psi_mobile_cls=mob.get("cls", "N/A"),
-        psi_mobile_fcp=mob.get("fcp", "N/A"),
-        psi_mobile_ttfb=mob.get("ttfb", "N/A"),
-        psi_desktop_lcp=desk.get("lcp", "N/A"),
-        psi_desktop_fcp=desk.get("fcp", "N/A"),
-        psi_desktop_ttfb=desk.get("ttfb", "N/A"),
-        psi_opportunities=opp_lines,
-        # Existing scrape signals
-        https=signals["https"],
-        viewport=signals["viewport"] or "NOT FOUND",
-        canonical=signals["canonical"] or "NOT FOUND",
-        robots_meta=signals["robots_meta"] or "NOT FOUND",
-        schemas=", ".join(signals["schemas"]) if signals["schemas"] else "None found",
-        images_total=signals["images_total"],
-        images_missing_alt=signals["images_missing_alt"] or "None",
-        lazy_loaded_images=signals["lazy_loaded_images"],
-        render_blocking_scripts=signals["render_blocking_scripts"],
-        inline_style_bytes=signals["inline_style_bytes"],
-        # New signals
-        redirect_hops=redir.get("hops", "N/A"),
-        redirect_status=redir.get("status", "N/A"),
-        redirect_chain=" → ".join(redir.get("chain", [])) or "N/A",
-        og_tags_present=bool(og),
-        og_tag_keys=", ".join(og.keys()) or "None",
-        twitter_tags_present=bool(tw),
-        twitter_tag_keys=", ".join(tw.keys()) or "None",
-        html_ratio_pct=html_ratio.get("ratio_pct", "N/A"),
-        html_ratio_status=html_ratio.get("status", "N/A"),
-        html_bytes=html_ratio.get("html_bytes", "N/A"),
-        text_bytes=html_ratio.get("text_bytes", "N/A"),
-        broken_link_count=broken.get("broken_count", 0),
-        links_checked=broken.get("total_checked", 0),
-        broken_link_urls=broken_urls,
-        robots_txt_exists=robots_txt.get("exists", False),
-        robots_blocks=robots_txt.get("blocks_important", False),
-        sitemap_exists=sitemap.get("exists", False),
-        sitemap_url_count=sitemap.get("url_count", 0),
-    )
+        prompt = TECHNICAL_PROMPT.format(
+            business_name=request.business_name or "this business",
+            business_type=request.business_type or "local business",
+            target_url=request.target_url,
+            keyword=request.keyword,
+            # PageSpeed
+            psi_mobile_score=mob.get("performance_score", "N/A"),
+            psi_desktop_score=desk.get("performance_score", "N/A"),
+            psi_mobile_lcp=mob.get("lcp", "N/A"),
+            psi_mobile_inp=mob.get("inp", "N/A"),
+            psi_mobile_cls=mob.get("cls", "N/A"),
+            psi_mobile_fcp=mob.get("fcp", "N/A"),
+            psi_mobile_ttfb=mob.get("ttfb", "N/A"),
+            psi_desktop_lcp=desk.get("lcp", "N/A"),
+            psi_desktop_fcp=desk.get("fcp", "N/A"),
+            psi_desktop_ttfb=desk.get("ttfb", "N/A"),
+            psi_opportunities=opp_lines,
+            # Existing scrape signals
+            https=signals.get("https", False),
+            viewport=signals.get("viewport") or "NOT FOUND",
+            canonical=signals.get("canonical") or "NOT FOUND",
+            robots_meta=signals.get("robots_meta") or "NOT FOUND",
+            schemas=", ".join(signals.get("schemas", [])) or "None found",
+            images_total=signals.get("images_total", 0),
+            images_missing_alt=signals.get("images_missing_alt") or "None",
+            lazy_loaded_images=signals.get("lazy_loaded_images", 0),
+            render_blocking_scripts=signals.get("render_blocking_scripts", 0),
+            inline_style_bytes=signals.get("inline_style_bytes", 0),
+            # New signals
+            redirect_hops=redir.get("hops", "N/A"),
+            redirect_status=redir.get("status", "N/A"),
+            redirect_chain=" → ".join(redir.get("chain", [])) or "N/A",
+            og_tags_present=bool(og),
+            og_tag_keys=", ".join(og.keys()) or "None",
+            twitter_tags_present=bool(tw),
+            twitter_tag_keys=", ".join(tw.keys()) or "None",
+            html_ratio_pct=html_ratio.get("ratio_pct", "N/A"),
+            html_ratio_status=html_ratio.get("status", "N/A"),
+            html_bytes=html_ratio.get("html_bytes", "N/A"),
+            text_bytes=html_ratio.get("text_bytes", "N/A"),
+            broken_link_count=broken.get("broken_count", 0),
+            links_checked=broken.get("total_checked", 0),
+            broken_link_urls=broken_urls,
+            robots_txt_exists=robots_txt.get("exists", False),
+            robots_blocks=robots_txt.get("blocks_important", False),
+            sitemap_exists=sitemap.get("exists", False),
+            sitemap_url_count=sitemap.get("url_count", 0),
+        )
 
-    # Append site-wide crawl summary when available
-    if crawl_aggregate and crawl_aggregate.get("pages_crawled", 0) > 1:
-        agg = crawl_aggregate
-        thin_list = ", ".join(agg.get("thin_content_pages", [])[:5]) or "None"
-        prompt += f"""
+        # Append site-wide crawl summary when available
+        if crawl_aggregate and crawl_aggregate.get("pages_crawled", 0) > 1:
+            agg = crawl_aggregate
+            thin_list = ", ".join(agg.get("thin_content_pages", [])[:5]) or "None"
+            prompt += f"""
 
 SITE-WIDE CRAWL DATA ({agg['pages_crawled']} pages crawled):
 - Pages missing title tag: {agg['missing_title']}
@@ -1780,22 +1781,26 @@ SITE-WIDE CRAWL DATA ({agg['pages_crawled']} pages crawled):
 
 Factor these site-wide issues into your priority_actions — e.g. if 8/20 pages are missing meta descriptions, that's a site-wide fix."""
 
-    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=4000)
+        recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=4000)
 
-    return {
-        "agent": "technical_seo",
-        "audit_id": audit_id,
-        "status": "completed",
-        "keyword": request.keyword,
-        "target_url": request.target_url,
-        "page_scraped": signals["success"],
-        "pagespeed_fetched": psi["success"],
-        "pagespeed": psi,
-        "signals": signals,
-        "crawl_aggregate": crawl_aggregate or {},
-        "recommendations": recommendations,
-        "timestamp": datetime.now().isoformat(),
-    }
+        return {
+            "agent": "technical_seo",
+            "audit_id": audit_id,
+            "status": "completed",
+            "keyword": request.keyword,
+            "target_url": request.target_url,
+            "page_scraped": signals.get("success", False),
+            "pagespeed_fetched": psi.get("success", False),
+            "pagespeed": psi,
+            "signals": signals,
+            "crawl_aggregate": crawl_aggregate or {},
+            "recommendations": recommendations,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"[{audit_id}] Technical SEO agent failed: {type(e).__name__}: {e}", exc_info=True)
+        raise
 
 
 # =============================================================================
