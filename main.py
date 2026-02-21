@@ -358,7 +358,8 @@ def auth_oauth_sync(body: OAuthSyncRequest):
 def extract_json(text: str) -> dict | list:
     """
     Robustly extract JSON from Claude responses.
-    Handles markdown fences, preamble text, and trailing commentary.
+    Handles markdown fences, preamble text, trailing commentary,
+    and truncated JSON (from max_tokens cutoff).
     Returns a dict or list; wraps unparseable text in {"raw_response": text}.
     """
     text = text.strip()
@@ -374,11 +375,10 @@ def extract_json(text: str) -> dict | list:
     except json.JSONDecodeError:
         pass
 
-    # Find the outermost balanced braces or brackets
+    # Find the outermost JSON object or array
     obj_start = text.find("{")
     arr_start = text.find("[")
 
-    # Pick whichever opening delimiter appears first
     if obj_start == -1 and arr_start == -1:
         return {"raw_response": text}
 
@@ -387,11 +387,26 @@ def extract_json(text: str) -> dict | list:
     else:
         start, open_c, close_c = obj_start, "{", "}"
 
+    # String-aware brace counting
+    in_string = False
+    escape = False
     depth = 0
     for i in range(start, len(text)):
-        if text[i] == open_c:
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == open_c:
             depth += 1
-        elif text[i] == close_c:
+        elif ch == close_c:
             depth -= 1
             if depth == 0:
                 try:
@@ -399,7 +414,72 @@ def extract_json(text: str) -> dict | list:
                 except json.JSONDecodeError:
                     break
 
+    # Truncated JSON repair: close unclosed strings, arrays, and objects
+    fragment = text[start:]
+    repaired = _repair_truncated_json(fragment)
+    if repaired is not None:
+        return repaired
+
     return {"raw_response": text}
+
+
+def _repair_truncated_json(fragment: str) -> dict | list | None:
+    """Attempt to repair JSON truncated by max_tokens cutoff."""
+    # Trim trailing incomplete value (e.g. cut-off string or number)
+    # Find the last complete key-value separator
+    trimmed = fragment.rstrip()
+
+    # Close unclosed string
+    in_str = False
+    escape = False
+    for ch in trimmed:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+
+    if in_str:
+        trimmed += '"'
+
+    # Remove trailing comma
+    trimmed = trimmed.rstrip().rstrip(",")
+
+    # Count unclosed braces/brackets (string-aware)
+    stack = []
+    in_str = False
+    escape = False
+    for ch in trimmed:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in ('{', '['):
+            stack.append(ch)
+        elif ch == '}' and stack and stack[-1] == '{':
+            stack.pop()
+        elif ch == ']' and stack and stack[-1] == '[':
+            stack.pop()
+
+    # Close all unclosed brackets/braces
+    closers = {'[': ']', '{': '}'}
+    for opener in reversed(stack):
+        trimmed += closers[opener]
+
+    try:
+        return json.loads(trimmed)
+    except json.JSONDecodeError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1329,7 +1409,7 @@ async def on_page_seo_agent(request: AuditRequest, pre_scraped_pages: list[dict]
         competitor_data=competitor_data,
     ) + extra_pages_section
 
-    recommendations = await call_claude(ONPAGE_SYSTEM, prompt, max_tokens=2000)
+    recommendations = await call_claude(ONPAGE_SYSTEM, prompt, max_tokens=4000)
 
     return {
         "agent": "on_page_seo",
@@ -1700,7 +1780,7 @@ SITE-WIDE CRAWL DATA ({agg['pages_crawled']} pages crawled):
 
 Factor these site-wide issues into your priority_actions — e.g. if 8/20 pages are missing meta descriptions, that's a site-wide fix."""
 
-    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=2000)
+    recommendations = await call_claude(TECHNICAL_SYSTEM, prompt, max_tokens=4000)
 
     return {
         "agent": "technical_seo",
@@ -2521,7 +2601,7 @@ async def ai_seo_agent(request: AuditRequest):
         competitor_data=competitor_data,
     )
 
-    analysis = await call_claude(AISEO_SYSTEM, prompt, max_tokens=2800)
+    analysis = await call_claude(AISEO_SYSTEM, prompt, max_tokens=4000)
 
     return {
         "agent": "ai_seo",
@@ -3600,7 +3680,7 @@ async def gbp_audit_agent(request: AuditRequest):
         content_excerpt=page_data.get("content", "")[:600],
     )
 
-    analysis = await call_claude(GBP_SYSTEM, prompt, max_tokens=2500)
+    analysis = await call_claude(GBP_SYSTEM, prompt, max_tokens=4000)
 
     return {
         "agent": "gbp_audit",
@@ -3765,7 +3845,7 @@ async def citation_builder_agent(request: AuditRequest):
         citation_list="\n".join(citation_lines),
     )
 
-    plan = await call_claude(CITATION_SYSTEM, prompt, max_tokens=2500)
+    plan = await call_claude(CITATION_SYSTEM, prompt, max_tokens=4000)
 
     return {
         "agent": "citation_builder",
