@@ -3492,8 +3492,13 @@ async def _fetch_serp_rich(keyword: str, location: str, target_url: str) -> dict
     except Exception:
         return result
 
-    # Local pack
-    for i, place in enumerate(data.get("local_results", [])[:3], start=1):
+    # Local pack — ensure list (SerpAPI sometimes returns a dict)
+    local_results = data.get("local_results", [])
+    if not isinstance(local_results, list):
+        local_results = list(local_results.values()) if isinstance(local_results, dict) else []
+    for i, place in enumerate(local_results[:3], start=1):
+        if not isinstance(place, dict):
+            continue
         entry = {
             "rank": i,
             "title": place.get("title", ""),
@@ -3508,14 +3513,19 @@ async def _fetch_serp_rich(keyword: str, location: str, target_url: str) -> dict
         if client_domain and client_domain in (entry["website"] or ""):
             result["client_map_rank"] = i
 
-    # Organic results
-    for i, org in enumerate(data.get("organic_results", [])[:20], start=1):
+    # Organic results — ensure list
+    organic_results = data.get("organic_results", [])
+    if not isinstance(organic_results, list):
+        organic_results = list(organic_results.values()) if isinstance(organic_results, dict) else []
+    for i, org in enumerate(organic_results[:20], start=1):
+        if not isinstance(org, dict):
+            continue
         link = org.get("link", "")
         entry = {
             "rank": i,
             "title": org.get("title", ""),
             "url": link,
-            "snippet": org.get("snippet", "")[:150],
+            "snippet": (org.get("snippet") or "")[:150],
         }
         result["organic_results"].append(entry)
         if client_domain and client_domain in link:
@@ -4308,25 +4318,6 @@ def export_audit_pdf(audit_id: str, current_user: CurrentUser = Depends(get_curr
 # =============================================================================
 # Health & info
 # =============================================================================
-
-@app.get("/debug/gbp-test")
-async def debug_gbp():
-    """Temporary debug endpoint — test GBP agent and capture errors."""
-    import traceback
-    try:
-        req = AuditRequest(
-            keyword="plumber near me",
-            target_url="https://mrrooter.com",
-            location="Toronto, Canada",
-            business_name="Mr. Rooter Plumbing",
-            business_type="plumber",
-        )
-        result = await gbp_audit_agent(req)
-        return {"status": "ok", "keys": list(result.keys())}
-    except Exception as e:
-        tb = traceback.format_exc()
-        return {"status": "error", "error": f"{type(e).__name__}: {e}", "traceback": tb}
-
 
 @app.get("/health")
 async def health():
