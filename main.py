@@ -3639,67 +3639,75 @@ async def gbp_audit_agent(request: AuditRequest):
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] GBP Audit starting for '{request.target_url}'")
 
-    biz_name = request.business_name or "this business"
-    biz_type = request.business_type or "local business"
+    try:
+        biz_name = request.business_name or "this business"
+        biz_type = request.business_type or "local business"
 
-    # Fetch SERP data + page data concurrently
-    serp_data, page_data = await asyncio.gather(
-        _fetch_serp_rich(request.keyword, request.location, request.target_url),
-        scrape_page(request.target_url),
-    )
-
-    # Format map pack competitors
-    pack_lines = []
-    for entry in serp_data["local_pack"]:
-        rating = f"{entry['rating']}★ ({entry['reviews']} reviews)" if entry.get("rating") else "no rating data"
-        pack_lines.append(
-            f"  #{entry['rank']}: {entry['title']} — {entry['address']} — {rating}"
+        # Fetch SERP data + page data concurrently
+        serp_data, page_data = await asyncio.gather(
+            _fetch_serp_rich(request.keyword, request.location, request.target_url),
+            scrape_page(request.target_url),
         )
-    map_pack_str = "\n".join(pack_lines) or "No local pack found for this keyword."
 
-    # Format top organic competitors
-    organic_comp_lines = [
-        f"  #{r['rank']}: {r['title']} — {r['url']}"
-        for r in serp_data["organic_results"][:5]
-    ]
-    organic_comps_str = "\n".join(organic_comp_lines) or "No organic results."
+        # Format map pack competitors
+        pack_lines = []
+        for entry in serp_data.get("local_pack", []):
+            rating = f"{entry.get('rating', '?')}★ ({entry.get('reviews', '?')} reviews)" if entry.get("rating") else "no rating data"
+            pack_lines.append(
+                f"  #{entry.get('rank', '?')}: {entry.get('title', '?')} — {entry.get('address', '?')} — {rating}"
+            )
+        map_pack_str = "\n".join(pack_lines) or "No local pack found for this keyword."
 
-    map_rank = serp_data["client_map_rank"]
-    org_rank = serp_data["client_organic_rank"]
+        # Format top organic competitors
+        organic_comp_lines = [
+            f"  #{r.get('rank', '?')}: {r.get('title', '?')} — {r.get('url', '?')}"
+            for r in serp_data.get("organic_results", [])[:5]
+        ]
+        organic_comps_str = "\n".join(organic_comp_lines) or "No organic results."
 
-    prompt = GBP_PROMPT.format(
-        business_name=biz_name,
-        business_type=biz_type,
-        location=request.location,
-        target_url=request.target_url,
-        keyword=request.keyword,
-        map_pack_rank=f"#{map_rank}" if map_rank else "Not in top 3",
-        in_pack=bool(map_rank),
-        map_pack_rank_raw=map_rank,
-        map_pack_competitors=map_pack_str,
-        organic_rank=f"#{org_rank}" if org_rank else "Not in top 20",
-        organic_competitors=organic_comps_str,
-        title=page_data.get("title", "N/A"),
-        h1=page_data.get("h1", "N/A"),
-        nap_on_page="Check content below",
-        content_excerpt=page_data.get("content", "")[:600],
-    )
+        map_rank = serp_data.get("client_map_rank")
+        org_rank = serp_data.get("client_organic_rank")
 
-    analysis = await call_claude(GBP_SYSTEM, prompt, max_tokens=4000)
+        # Escape curly braces in user-supplied content to prevent format() crash
+        content_excerpt = (page_data.get("content", "") or "")[:600].replace("{", "{{").replace("}", "}}")
 
-    return {
-        "agent": "gbp_audit",
-        "audit_id": audit_id,
-        "status": "completed",
-        "keyword": request.keyword,
-        "target_url": request.target_url,
-        "map_pack_rank": map_rank,
-        "organic_rank": org_rank,
-        "serp_features": serp_data["serp_features"],
-        "local_pack": serp_data["local_pack"],
-        "analysis": analysis,
-        "timestamp": datetime.now().isoformat(),
-    }
+        prompt = GBP_PROMPT.format(
+            business_name=biz_name,
+            business_type=biz_type,
+            location=request.location,
+            target_url=request.target_url,
+            keyword=request.keyword,
+            map_pack_rank=f"#{map_rank}" if map_rank else "Not in top 3",
+            in_pack=bool(map_rank),
+            map_pack_rank_raw=map_rank,
+            map_pack_competitors=map_pack_str,
+            organic_rank=f"#{org_rank}" if org_rank else "Not in top 20",
+            organic_competitors=organic_comps_str,
+            title=(page_data.get("title") or "N/A").replace("{", "{{").replace("}", "}}"),
+            h1=(page_data.get("h1") or "N/A").replace("{", "{{").replace("}", "}}"),
+            nap_on_page="Check content below",
+            content_excerpt=content_excerpt,
+        )
+
+        analysis = await call_claude(GBP_SYSTEM, prompt, max_tokens=4000)
+
+        return {
+            "agent": "gbp_audit",
+            "audit_id": audit_id,
+            "status": "completed",
+            "keyword": request.keyword,
+            "target_url": request.target_url,
+            "map_pack_rank": map_rank,
+            "organic_rank": org_rank,
+            "serp_features": serp_data.get("serp_features", []),
+            "local_pack": serp_data.get("local_pack", []),
+            "analysis": analysis,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"[{audit_id}] GBP Audit agent failed: {type(e).__name__}: {e}", exc_info=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -4300,6 +4308,25 @@ def export_audit_pdf(audit_id: str, current_user: CurrentUser = Depends(get_curr
 # =============================================================================
 # Health & info
 # =============================================================================
+
+@app.get("/debug/gbp-test")
+async def debug_gbp():
+    """Temporary debug endpoint — test GBP agent and capture errors."""
+    import traceback
+    try:
+        req = AuditRequest(
+            keyword="plumber near me",
+            target_url="https://mrrooter.com",
+            location="Toronto, Canada",
+            business_name="Mr. Rooter Plumbing",
+            business_type="plumber",
+        )
+        result = await gbp_audit_agent(req)
+        return {"status": "ok", "keys": list(result.keys())}
+    except Exception as e:
+        tb = traceback.format_exc()
+        return {"status": "error", "error": f"{type(e).__name__}: {e}", "traceback": tb}
+
 
 @app.get("/health")
 async def health():
