@@ -3835,24 +3835,24 @@ def build_content_data(agents: dict) -> dict:
     area_pages_raw = local_content.get("service_area_pages", [])
     service_areas = []
     primary_kw = kw_rec.get("primary_keyword", op.get("keyword", ""))
+    # Build service prefix by removing location words from keyword
+    # e.g. "kitchen cabinets toronto" → location words {"toronto"} → prefix "kitchen cabinets"
+    location_str = local.get("location", "")
+    loc_words = set(w.lower() for w in location_str.split(",")[0].split() if len(w) > 2)
+    kw_words = primary_kw.lower().split()
+    service_prefix = " ".join(w for w in kw_words if w not in loc_words)
+
     for area in area_pages_raw:
         if isinstance(area, str):
             # Parse "Kitchen Cabinets North York" → city="North York"
-            # Strategy: strip the primary keyword prefix/suffix to find the city name
             area_lower = area.lower().strip()
-            kw_lower = primary_kw.lower().strip()
-            # Try removing the keyword from the beginning or end
             city = area
-            # Remove common service prefixes to extract just the city
-            for prefix in [kw_lower, kw_lower.split()[0] if kw_lower else ""]:
-                if area_lower.startswith(prefix) and len(area_lower) > len(prefix) + 1:
-                    city = area[len(prefix):].strip()
-                    break
-                if area_lower.endswith(prefix) and len(area_lower) > len(prefix) + 1:
-                    city = area[:len(area) - len(prefix)].strip()
-                    break
+            if service_prefix and area_lower.startswith(service_prefix):
+                city = area[len(service_prefix):].strip()
+            elif service_prefix and area_lower.endswith(service_prefix):
+                city = area[:len(area) - len(service_prefix)].strip()
             service_areas.append({
-                "city": city,
+                "city": city if city else area,
                 "keyword": area.lower(),
                 "volume": 120,
                 "difficulty": 18,
