@@ -3569,7 +3569,11 @@ def build_gmb_data(agents: dict) -> dict:
     for field_key, (label, priority) in field_map.items():
         item = completeness.get(field_key, {})
         if isinstance(item, dict):
-            done = item.get("status") in ("pass",)
+            status = item.get("status", "unknown")
+            done = status == "pass"
+            # "warn" means partially done — mark as done for checklist but note the issue
+            if status == "warn":
+                done = True
         else:
             done = False
         checklist.append({"item": label, "done": done, "priority": priority})
@@ -3830,17 +3834,23 @@ def build_content_data(agents: dict) -> dict:
     local_content = local_rec.get("local_content_strategy", {})
     area_pages_raw = local_content.get("service_area_pages", [])
     service_areas = []
+    primary_kw = kw_rec.get("primary_keyword", op.get("keyword", ""))
     for area in area_pages_raw:
         if isinstance(area, str):
             # Parse "Kitchen Cabinets North York" → city="North York"
-            parts = area.rsplit(" ", 1)
-            city = parts[-1] if len(parts) > 1 else area
-            # Try to extract city more intelligently
-            common_cities = area.split(" ")
-            if len(common_cities) >= 3:
-                city = " ".join(common_cities[-2:]) if common_cities[-2][0].isupper() else common_cities[-1]
-            else:
-                city = common_cities[-1]
+            # Strategy: strip the primary keyword prefix/suffix to find the city name
+            area_lower = area.lower().strip()
+            kw_lower = primary_kw.lower().strip()
+            # Try removing the keyword from the beginning or end
+            city = area
+            # Remove common service prefixes to extract just the city
+            for prefix in [kw_lower, kw_lower.split()[0] if kw_lower else ""]:
+                if area_lower.startswith(prefix) and len(area_lower) > len(prefix) + 1:
+                    city = area[len(prefix):].strip()
+                    break
+                if area_lower.endswith(prefix) and len(area_lower) > len(prefix) + 1:
+                    city = area[:len(area) - len(prefix)].strip()
+                    break
             service_areas.append({
                 "city": city,
                 "keyword": area.lower(),
@@ -3848,15 +3858,39 @@ def build_content_data(agents: dict) -> dict:
                 "difficulty": 18,
             })
 
-    # --- FAQ suggestions from ai_seo ---
+    # --- FAQ suggestions from ai_seo (faq_content) + priority_actions questions ---
     faq_suggestions = []
+    seen_qs = set()
     for faq in ai_analysis.get("faq_content", []):
         if isinstance(faq, dict):
-            faq_suggestions.append({
-                "question": faq.get("question", ""),
-                "volume": 200,
-                "source": "PAA",
-            })
+            q = faq.get("question", "")
+            if q and q.lower() not in seen_qs:
+                seen_qs.add(q.lower())
+                faq_suggestions.append({
+                    "question": q,
+                    "volume": 200,
+                    "source": faq.get("ai_intent", "PAA"),
+                })
+    # Also pull questions from schema_templates FAQ answers
+    for tmpl in ai_analysis.get("schema_templates", []):
+        if isinstance(tmpl, dict) and tmpl.get("type") == "FAQPage":
+            # The json_ld might have questions embedded
+            pass
+    # Pull from current_gaps as implicit questions
+    for gap in ai_analysis.get("current_gaps", []):
+        if isinstance(gap, str) and "?" in gap and gap.lower() not in seen_qs:
+            seen_qs.add(gap.lower())
+            faq_suggestions.append({"question": gap, "volume": 150, "source": "AI Gap"})
+    # If still empty, generate from priority_actions
+    for action in ai_analysis.get("priority_actions", []):
+        if isinstance(action, dict) and len(faq_suggestions) < 5:
+            why = action.get("why", "")
+            if why and "?" not in why:
+                # Convert action to a question format
+                q = f"How to {action.get('action', '')[:80]}?"
+                if q.lower() not in seen_qs:
+                    seen_qs.add(q.lower())
+                    faq_suggestions.append({"question": q, "volume": 100, "source": "AI Strategy"})
 
     # --- Blog topics from keyword gap + content gaps ---
     blog_topics = []
@@ -3908,6 +3942,10 @@ def build_post_calendar(request_data: dict, keyword_data: dict) -> list[dict]:
     biz_name = request_data.get("business_name", "")
     biz_type = request_data.get("business_type", "local business")
     location = request_data.get("location", "")
+    # Extract city from location (e.g. "Toronto" from "Toronto, Canada")
+    city = location.split(",")[0].strip() if location else "your area"
+    # Use keyword for more natural post titles
+    kw_short = keyword.rsplit(" ", 1)[0] if " " in keyword else keyword  # e.g. "kitchen cabinets"
 
     # Find next Monday
     today = datetime.now()
@@ -3920,24 +3958,24 @@ def build_post_calendar(request_data: dict, keyword_data: dict) -> list[dict]:
     weeks = []
     post_templates = [
         [
-            {"type": "GBP", "title": f"Before & after: recent {biz_type} project"},
-            {"type": "Social", "title": f"5 signs you need a {biz_type} in {location}"},
-            {"type": "Blog", "title": f"{biz_type.title()} cost guide for {location}"},
+            {"type": "GBP", "title": f"Before & after: {kw_short} transformation"},
+            {"type": "Social", "title": f"5 signs it's time to upgrade your {kw_short}"},
+            {"type": "Blog", "title": f"{kw_short.title()} cost guide for {city} homeowners"},
         ],
         [
-            {"type": "GBP", "title": f"Meet our {biz_type} team — behind the scenes"},
-            {"type": "Social", "title": f"Top {biz_type} trends for {today.year}"},
-            {"type": "Blog", "title": f"How to choose the right {biz_type} in {location}"},
+            {"type": "GBP", "title": f"Meet the {biz_name} team — behind the scenes"},
+            {"type": "Social", "title": f"Top {kw_short} trends for {today.year}"},
+            {"type": "Blog", "title": f"How to choose the right {kw_short} in {city}"},
         ],
         [
-            {"type": "GBP", "title": f"Customer spotlight: happy {biz_type} client"},
-            {"type": "Social", "title": f"Common {biz_type} mistakes to avoid"},
-            {"type": "Blog", "title": f"{biz_type.title()} ideas homeowners in {location} love"},
+            {"type": "GBP", "title": f"Customer spotlight: happy {biz_name} client"},
+            {"type": "Social", "title": f"Common {kw_short} mistakes to avoid"},
+            {"type": "Blog", "title": f"{kw_short.title()} ideas {city} homeowners love"},
         ],
         [
-            {"type": "GBP", "title": f"Seasonal {biz_type} tips for {location} homes"},
-            {"type": "Social", "title": f"FAQ: what our {biz_type} clients ask most"},
-            {"type": "Blog", "title": f"DIY vs professional {biz_type}: {location} guide"},
+            {"type": "GBP", "title": f"Seasonal {kw_short} tips for {city} homes"},
+            {"type": "Social", "title": f"FAQ: questions our {kw_short} clients ask most"},
+            {"type": "Blog", "title": f"DIY vs professional {kw_short}: {city} guide"},
         ],
     ]
 
