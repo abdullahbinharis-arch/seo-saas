@@ -3476,6 +3476,501 @@ def build_seo_tasks(quick_wins: list[dict], pillars: dict) -> list[dict]:
     return tasks
 
 
+# =============================================================================
+# TOOL-PAGE BUILDERS — flatten agent outputs into the frontend-ready format
+# =============================================================================
+
+def build_gmb_data(agents: dict) -> dict:
+    """Build gmb_data section from gbp_audit + citation_builder + local_seo agents."""
+    gbp = agents.get("gbp_audit", {})
+    cit = agents.get("citation_builder", {})
+    local = agents.get("local_seo", {})
+    gbp_a = gbp.get("analysis", {})
+    cit_plan = cit.get("plan", {})
+    local_rec = local.get("recommendations", {})
+
+    # --- GBP Score ---
+    gbp_score = int(gbp_a.get("gbp_score", 0))
+
+    # --- Reviews from map pack or GBP analysis ---
+    pack = gbp_a.get("map_pack_status", {})
+    review_count = 0
+    avg_rating = 0.0
+    # Try to get from local_pack data on the gbp agent result
+    local_pack = gbp.get("local_pack", [])
+    # Find the client's own entry in the pack
+    for entry in local_pack:
+        if isinstance(entry, dict):
+            reviews = entry.get("reviews")
+            rating = entry.get("rating")
+            if reviews is not None and rating is not None:
+                # Use first entry as proxy if client is not in pack
+                if review_count == 0:
+                    review_count = int(reviews) if reviews else 0
+                    avg_rating = float(rating) if rating else 0.0
+    # Override with review_strategy if available
+    rs = gbp_a.get("review_strategy", {})
+    vis = rs.get("current_visibility", "")
+    if "review" in vis.lower():
+        # Try to extract a number from the visibility text
+        import re as _re
+        nums = _re.findall(r'(\d+)', vis)
+        if nums:
+            review_count = int(nums[0])
+
+    # --- Response rate (estimated) ---
+    review_responses = gbp_a.get("completeness_audit", {}).get("review_responses", {})
+    rr_status = review_responses.get("status", "unknown") if isinstance(review_responses, dict) else "unknown"
+    response_rate = "100%" if rr_status == "pass" else "50%" if rr_status == "warn" else "0%"
+
+    # --- Photos ---
+    photos_cover = gbp_a.get("completeness_audit", {}).get("photos_cover", {})
+    photos_interior = gbp_a.get("completeness_audit", {}).get("photos_interior", {})
+    photos_count = 0
+    for pf in [photos_cover, photos_interior]:
+        if isinstance(pf, dict) and pf.get("status") == "pass":
+            photos_count += 5  # estimate
+    photos_needed = max(0, 40 - photos_count)
+
+    # --- NAP ---
+    nap_raw = gbp_a.get("nap_consistency", {})
+    gbp_opt = local_rec.get("gbp_optimization", {})
+    categories = gbp_opt.get("categories", [])
+    primary_cat = categories[0] if categories else "Local Business"
+    completeness = gbp_a.get("completeness_audit", {})
+    cat_status = completeness.get("primary_category", {})
+    cat_optimal = (cat_status.get("status") == "pass") if isinstance(cat_status, dict) else False
+
+    nap = {
+        "name": nap_raw.get("name_on_website", ""),
+        "address": nap_raw.get("address_on_website", "not detected"),
+        "phone": nap_raw.get("phone_on_website", "not detected"),
+        "website": gbp.get("target_url", ""),
+        "category": primary_cat,
+        "category_optimal": cat_optimal,
+    }
+
+    # --- Checklist from completeness_audit ---
+    checklist = []
+    field_map = {
+        "business_name_consistent": ("Business name claimed", "high"),
+        "phone_number": ("Phone number added", "high"),
+        "website_linked": ("Website linked", "high"),
+        "business_hours": ("Business hours set", "high"),
+        "primary_category": ("Primary category set", "medium"),
+        "description": ("Business description", "medium"),
+        "photos_cover": ("40+ photos uploaded", "high"),
+        "products_services": ("Services with descriptions", "high"),
+        "qa_section": ("10 seeded Q&As", "medium"),
+        "attributes": ("Attributes set", "low"),
+        "posts_active": ("GBP posts active", "medium"),
+        "review_responses": ("Review responses", "medium"),
+    }
+    for field_key, (label, priority) in field_map.items():
+        item = completeness.get(field_key, {})
+        if isinstance(item, dict):
+            done = item.get("status") in ("pass",)
+        else:
+            done = False
+        checklist.append({"item": label, "done": done, "priority": priority})
+
+    # --- Citations from citation_builder ---
+    citations = []
+    cit_recs = cit_plan.get("recommendations", {})
+    if isinstance(cit_recs, dict):
+        for tier_key in ("tier_1_critical", "tier_2_important", "tier_3_supplemental"):
+            for c in (cit_recs.get(tier_key) or []):
+                if isinstance(c, dict):
+                    citations.append({
+                        "directory": c.get("name", "Unknown"),
+                        "da": int(c.get("da", 0)),
+                        "found": c.get("status", "likely_missing") != "likely_missing",
+                        "nap_match": "exact" if c.get("status") != "likely_missing" else None,
+                    })
+
+    return {
+        "gbp_score": gbp_score,
+        "review_count": review_count,
+        "avg_rating": avg_rating,
+        "response_rate": response_rate,
+        "photos_count": photos_count,
+        "photos_needed": photos_needed,
+        "nap": nap,
+        "checklist": checklist,
+        "citations": citations,
+    }
+
+
+def _difficulty_to_int(diff_str) -> int:
+    """Convert difficulty string (low/medium/high) to a numeric value."""
+    if isinstance(diff_str, (int, float)):
+        return int(diff_str)
+    d = str(diff_str).lower()
+    if "low" in d or "easy" in d:
+        return 22
+    if "med" in d:
+        return 45
+    if "high" in d or "hard" in d:
+        return 68
+    return 40
+
+
+def _volume_to_int(vol) -> int:
+    """Convert volume label or int to a numeric estimate."""
+    if isinstance(vol, (int, float)):
+        return int(vol)
+    v = str(vol).lower()
+    if "high" in v:
+        return 1200
+    if "med" in v:
+        return 480
+    if "low" in v:
+        return 140
+    # Try parsing directly
+    try:
+        return int(vol)
+    except (ValueError, TypeError):
+        return 200
+
+
+def build_keyword_data(agents: dict, auto_detected: dict | None) -> dict:
+    """Build keyword_data section from keyword_research agent."""
+    kw = agents.get("keyword_research", {})
+    recs = kw.get("recommendations", {})
+
+    primary = recs.get("primary_keyword", kw.get("keyword", ""))
+
+    # --- Keywords from high_intent_keywords ---
+    keywords = []
+    for i, hik in enumerate(recs.get("high_intent_keywords", [])):
+        if not isinstance(hik, dict):
+            continue
+        kw_text = hik.get("keyword", "")
+        vol = hik.get("estimated_monthly_searches", 0)
+        diff = hik.get("difficulty", "medium")
+        intent = hik.get("intent", "commercial")
+        is_primary = (kw_text.lower() == primary.lower())
+        # Map difficulty to action
+        diff_val = _difficulty_to_int(diff)
+        if diff_val < 30:
+            action = "Easy win"
+        elif is_primary:
+            action = "Optimize"
+        elif diff_val < 50:
+            action = "Improve"
+        else:
+            action = "Create page"
+
+        keywords.append({
+            "keyword": kw_text,
+            "volume": _volume_to_int(vol),
+            "difficulty": diff_val,
+            "intent": intent.capitalize() if isinstance(intent, str) else "Commercial",
+            "position": None,
+            "action": action,
+            "is_primary": is_primary,
+        })
+
+    # Ensure primary keyword is first
+    primary_items = [k for k in keywords if k.get("is_primary")]
+    other_items = [k for k in keywords if not k.get("is_primary")]
+    keywords = primary_items + other_items
+
+    # --- Keyword gaps from keyword_gap ---
+    keyword_gaps = []
+    for gap in recs.get("keyword_gap", []):
+        if not isinstance(gap, dict):
+            continue
+        kw_text = gap.get("keyword", "")
+        vol = gap.get("estimated_volume", "medium")
+        diff = gap.get("difficulty", "medium")
+        action = gap.get("action", "Create page")
+        category = gap.get("category", "missing")
+        keyword_gaps.append({
+            "keyword": kw_text,
+            "volume": _volume_to_int(vol),
+            "difficulty": _difficulty_to_int(diff),
+            "competitor": "",
+            "competitor_position": None,
+            "opportunity": action,
+        })
+
+    return {
+        "primary_keyword": primary,
+        "keywords": keywords[:20],
+        "keyword_gaps": keyword_gaps[:15],
+    }
+
+
+def build_backlink_data(agents: dict) -> dict:
+    """Build backlink_data section from backlink_analysis + link_building agents."""
+    bl = agents.get("backlink_analysis", {})
+    lb = agents.get("link_building", {})
+    bl_rec = bl.get("recommendations", {})
+    lb_rec = lb.get("recommendations", {})
+
+    da_obj = bl_rec.get("domain_authority", {})
+    bp = bl_rec.get("backlink_profile", {})
+
+    # Parse total backlinks (may be int or string like "40-150")
+    total_raw = bp.get("total_backlinks", 0)
+    if isinstance(total_raw, str):
+        # Take the higher end of a range
+        nums = [int(n) for n in re.findall(r'\d+', total_raw)]
+        total_backlinks = nums[-1] if nums else 0
+    else:
+        total_backlinks = int(total_raw)
+
+    referring_raw = bp.get("referring_domains", 0)
+    if isinstance(referring_raw, str):
+        nums = [int(n) for n in re.findall(r'\d+', referring_raw)]
+        referring_domains = nums[-1] if nums else 0
+    else:
+        referring_domains = int(referring_raw)
+
+    dofollow_pct = bp.get("dofollow_estimate_pct", 70)
+    dofollow = int(total_backlinks * (int(dofollow_pct) / 100))
+    nofollow = total_backlinks - dofollow
+
+    # Competitor comparison
+    comp_das = []
+    comp_domains = []
+    for comp in bl_rec.get("competitor_comparison", []):
+        if isinstance(comp, dict):
+            comp_das.append(int(comp.get("da", 0)))
+    competitor_avg_da = int(sum(comp_das) / len(comp_das)) if comp_das else da_obj.get("vs_competitors_avg", 0) or 0
+
+    # Current backlinks (limited data — build from quick_wins and competitor info)
+    current_backlinks = []
+    for win in bl_rec.get("quick_wins", [])[:5]:
+        if isinstance(win, str) and win:
+            current_backlinks.append({
+                "source": win[:60],
+                "da": 0,
+                "type": "follow",
+                "anchor": "",
+            })
+
+    # Opportunities from link_building agent
+    opportunities = []
+    for cat in ("quick_wins", "guest_posting", "resource_pages", "local_opportunities"):
+        for opp in (lb_rec.get(cat) or []):
+            if isinstance(opp, dict):
+                opportunities.append({
+                    "target": opp.get("name", ""),
+                    "da": int(opp.get("expected_da", 0)),
+                    "type": (opp.get("link_type") or cat.replace("_", " ")).capitalize(),
+                    "effort": (opp.get("difficulty") or "Medium").capitalize(),
+                    "url": opp.get("url", ""),
+                })
+    # Also add competitor gaps
+    for opp in (lb_rec.get("competitor_gaps") or []):
+        if isinstance(opp, dict):
+            opportunities.append({
+                "target": opp.get("name", ""),
+                "da": int(opp.get("expected_da", 0)),
+                "type": "Competitor Gap",
+                "effort": "Medium",
+                "url": opp.get("url", ""),
+            })
+
+    return {
+        "domain_authority": int(da_obj.get("score", 0)),
+        "total_backlinks": total_backlinks,
+        "dofollow": dofollow,
+        "nofollow": nofollow,
+        "referring_domains": referring_domains,
+        "competitor_avg_da": int(competitor_avg_da),
+        "competitor_avg_domains": 0,
+        "current_backlinks": current_backlinks,
+        "opportunities": opportunities[:15],
+    }
+
+
+def build_content_data(agents: dict) -> dict:
+    """Build content_data section from on_page_seo, keyword_research, local_seo, ai_seo agents."""
+    op = agents.get("on_page_seo", {})
+    kw = agents.get("keyword_research", {})
+    local = agents.get("local_seo", {})
+    ai = agents.get("ai_seo", {})
+    rewriter = agents.get("content_rewriter", {})
+
+    op_rec = op.get("recommendations", {})
+    kw_rec = kw.get("recommendations", {})
+    local_rec = local.get("recommendations", {})
+    ai_analysis = ai.get("analysis", {})
+    rewriter_rec = rewriter.get("recommendations", {})
+
+    # --- Homepage words ---
+    current = op_rec.get("current_analysis", {})
+    homepage_words = int(current.get("word_count", 0))
+
+    # Competitor avg from content rewriter benchmark
+    bench = rewriter_rec.get("benchmark", rewriter.get("benchmark", {}))
+    competitor_avg_words = int(bench.get("avg_competitor_word_count", 0)) or 1800
+
+    # --- Pages to rewrite (from on_page issues) ---
+    pages_to_rewrite = []
+    issues = current.get("issues_found", [])
+    if isinstance(issues, list):
+        for issue_text in issues:
+            if isinstance(issue_text, str):
+                # Classify as thin content, weak targeting, etc.
+                is_thin = any(w in issue_text.lower() for w in ["word count", "thin", "content depth", "short"])
+                if is_thin or len(pages_to_rewrite) < 3:
+                    pages_to_rewrite.append({
+                        "page": "Homepage",
+                        "url": "/",
+                        "words": homepage_words,
+                        "issue": issue_text[:120],
+                        "priority": "Critical" if is_thin else "Important",
+                    })
+
+    # --- Service areas from local_seo ---
+    local_content = local_rec.get("local_content_strategy", {})
+    area_pages_raw = local_content.get("service_area_pages", [])
+    service_areas = []
+    for area in area_pages_raw:
+        if isinstance(area, str):
+            # Parse "Kitchen Cabinets North York" → city="North York"
+            parts = area.rsplit(" ", 1)
+            city = parts[-1] if len(parts) > 1 else area
+            # Try to extract city more intelligently
+            common_cities = area.split(" ")
+            if len(common_cities) >= 3:
+                city = " ".join(common_cities[-2:]) if common_cities[-2][0].isupper() else common_cities[-1]
+            else:
+                city = common_cities[-1]
+            service_areas.append({
+                "city": city,
+                "keyword": area.lower(),
+                "volume": 120,
+                "difficulty": 18,
+            })
+
+    # --- FAQ suggestions from ai_seo ---
+    faq_suggestions = []
+    for faq in ai_analysis.get("faq_content", []):
+        if isinstance(faq, dict):
+            faq_suggestions.append({
+                "question": faq.get("question", ""),
+                "volume": 200,
+                "source": "PAA",
+            })
+
+    # --- Blog topics from keyword gap + content gaps ---
+    blog_topics = []
+    for gap in kw_rec.get("content_gap_opportunities", []):
+        if isinstance(gap, str) and gap:
+            blog_topics.append({
+                "title": gap,
+                "keyword": gap.lower(),
+                "volume": 300,
+                "difficulty": 25,
+                "word_target": 1800,
+            })
+    # Also pull from keyword_gap items with action "write blog post"
+    for gap in kw_rec.get("keyword_gap", []):
+        if isinstance(gap, dict) and "blog" in str(gap.get("action", "")).lower():
+            blog_topics.append({
+                "title": gap.get("keyword", ""),
+                "keyword": gap.get("keyword", "").lower(),
+                "volume": _volume_to_int(gap.get("estimated_volume", "medium")),
+                "difficulty": _difficulty_to_int(gap.get("difficulty", "medium")),
+                "word_target": 2000,
+            })
+    # Add blog topics from local_seo
+    for topic in local_content.get("blog_topics", []):
+        if isinstance(topic, str) and topic:
+            blog_topics.append({
+                "title": topic,
+                "keyword": topic.lower(),
+                "volume": 250,
+                "difficulty": 22,
+                "word_target": 1800,
+            })
+
+    return {
+        "homepage_words": homepage_words,
+        "competitor_avg_words": competitor_avg_words,
+        "pages_to_rewrite": pages_to_rewrite[:10],
+        "service_areas": service_areas[:10],
+        "faq_suggestions": faq_suggestions[:10],
+        "blog_topics": blog_topics[:10],
+    }
+
+
+def build_post_calendar(request_data: dict, keyword_data: dict) -> list[dict]:
+    """Build a 4-week post calendar structure (topics only, not generated content)."""
+    from datetime import timedelta
+
+    keyword = request_data.get("keyword", "")
+    biz_name = request_data.get("business_name", "")
+    biz_type = request_data.get("business_type", "local business")
+    location = request_data.get("location", "")
+
+    # Find next Monday
+    today = datetime.now()
+    days_ahead = 0 - today.weekday()  # Monday is 0
+    if days_ahead <= 0:
+        days_ahead += 7
+    next_monday = today + timedelta(days=days_ahead)
+
+    # Build 4 weeks of content
+    weeks = []
+    post_templates = [
+        [
+            {"type": "GBP", "title": f"Before & after: recent {biz_type} project"},
+            {"type": "Social", "title": f"5 signs you need a {biz_type} in {location}"},
+            {"type": "Blog", "title": f"{biz_type.title()} cost guide for {location}"},
+        ],
+        [
+            {"type": "GBP", "title": f"Meet our {biz_type} team — behind the scenes"},
+            {"type": "Social", "title": f"Top {biz_type} trends for {today.year}"},
+            {"type": "Blog", "title": f"How to choose the right {biz_type} in {location}"},
+        ],
+        [
+            {"type": "GBP", "title": f"Customer spotlight: happy {biz_type} client"},
+            {"type": "Social", "title": f"Common {biz_type} mistakes to avoid"},
+            {"type": "Blog", "title": f"{biz_type.title()} ideas homeowners in {location} love"},
+        ],
+        [
+            {"type": "GBP", "title": f"Seasonal {biz_type} tips for {location} homes"},
+            {"type": "Social", "title": f"FAQ: what our {biz_type} clients ask most"},
+            {"type": "Blog", "title": f"DIY vs professional {biz_type}: {location} guide"},
+        ],
+    ]
+
+    for i in range(4):
+        week_start = next_monday + timedelta(weeks=i)
+        weeks.append({
+            "week": i + 1,
+            "date": week_start.strftime("%Y-%m-%d"),
+            "posts": post_templates[i],
+        })
+
+    return weeks
+
+
+def build_auto_detected(request, auto_detected: dict | None, agents: dict) -> dict | None:
+    """Build the auto_detected section, filling from agent data when needed."""
+    if auto_detected:
+        return auto_detected
+
+    # Build from agent data if keyword was user-provided
+    local_rec = agents.get("local_seo", {}).get("recommendations", {})
+    gbp_opt = local_rec.get("gbp_optimization", {})
+    categories = gbp_opt.get("categories", [])
+    service_areas = local_rec.get("local_content_strategy", {}).get("service_area_pages", [])
+
+    return {
+        "business_type": request.business_type or "local business",
+        "primary_keyword": request.keyword or "",
+        "secondary_keywords": [],
+        "services": service_areas[:5] if service_areas else [],
+    }
+
+
 def calculate_cost_estimate(agents_run: int = 4) -> float:
     """Rough cost per audit based on token usage."""
     # ~3K input + ~2K output per agent × 3 agents
@@ -4253,32 +4748,58 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
         seo_tasks = build_seo_tasks(structured_wins, pillars)
         est_cost = calculate_cost_estimate()
 
+        # Build tool-page data sections
+        request_data = {
+            "keyword": request.keyword,
+            "business_name": request.business_name or "",
+            "business_type": request.business_type or "local business",
+            "location": request.location,
+            "target_url": request.target_url,
+        }
+        gmb_data = build_gmb_data(agents_dict)
+        keyword_data = build_keyword_data(agents_dict, auto_detected)
+        backlink_data = build_backlink_data(agents_dict)
+        content_data = build_content_data(agents_dict)
+        post_calendar = build_post_calendar(request_data, keyword_data)
+        auto_detected_section = build_auto_detected(request, auto_detected, agents_dict)
+
         report = {
             "audit_id": audit_id,
             "business_name": request.business_name or "",
             "business_type": request.business_type or "other",
             "keyword": request.keyword,
             "target_url": request.target_url,
-            "domain": request.domain or "",
             "location": request.location,
+            "timestamp": datetime.now().isoformat(),
             "status": "completed",
             "agents_executed": agents_run,
             "execution_time_seconds": elapsed,
             "estimated_cost": est_cost,
-            "timestamp": datetime.now().isoformat(),
+            # Auto-detected data
+            "auto_detected": auto_detected_section,
+            # Scores
             "scores": scores,
             "score_details": score_details,
-            "local_seo_score": scores["overall"],  # backward compat
+            # Tool-page data (flat sections for frontend)
+            "gmb_data": gmb_data,
+            "keyword_data": keyword_data,
+            "backlink_data": backlink_data,
+            "content_data": content_data,
+            "post_calendar": post_calendar,
+            # Quick wins, pillars, tasks (for overview + tasks pages)
             "quick_wins": structured_wins,
             "pillars": pillars,
             "seo_tasks": seo_tasks,
+            # Backward compat
+            "local_seo_score": scores["overall"],
+            "domain": request.domain or "",
             "site_aggregate": crawl_aggregate,
             "pages_crawled": pages_crawled_section,
-            "auto_detected": auto_detected,  # None when keyword was user-provided
+            # Raw agent data (for debugging / advanced views)
             "agents": agents_dict,
             "summary": {
                 "estimated_api_cost": est_cost,
-                "quick_wins": [w["title"] for w in structured_wins],  # backward compat string list
+                "quick_wins": [w["title"] for w in structured_wins],
             },
         }
 
