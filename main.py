@@ -5075,16 +5075,18 @@ def export_audit_pdf(audit_id: str, current_user: CurrentUser = Depends(get_curr
 CALENDAR_SYSTEM = """You are a local SEO content strategist. Generate a 4-week content calendar for a local business.
 Each week has 3 posts: a Google Business Profile (GBP) post, a social media post, and a blog intro.
 All content should be optimized for the business's primary keyword and location.
+Make each topic unique, specific, and locally relevant — reference the city, nearby areas, and seasonal trends.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
 Return format: {"weeks": [{"label": "Week 1", "posts": [{"type": "GBP Post", "title": "..."}, {"type": "Social Post", "title": "..."}, {"type": "Blog Intro", "title": "..."}]}]}"""
 
-POST_GENERATE_SYSTEM = """You are a local SEO content writer specializing in social media and Google Business Profile posts.
-Write engaging, concise content optimized for the given post type. Include relevant local keywords naturally.
-For GBP posts: 150-300 words, include a call-to-action.
-For social posts: 100-200 words, engaging and shareable.
-For blog intros: 200-400 words, hook the reader and include the primary keyword.
+POST_GENERATE_SYSTEM = """You are a local SEO content writer. Generate content for the specified post type.
+GBP post: 1500 chars max, include a call-to-action, mention the city/location prominently, use the primary keyword naturally.
+Social post: Instagram-style caption, engaging and shareable, include relevant hashtags.
+Blog intro: 300 words with an SEO-optimized opening paragraph + a 5-section outline for the full article.
+All content must reference the business name, location, and primary keyword naturally.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
-Return format: {"content": "the post content here", "hashtags": ["#relevant", "#hashtags"]}"""
+Return format: {"content": "the post content here", "hashtags": ["#relevant", "#hashtags"], "word_count": 250, "seo_score": 85}
+seo_score: rate 0-100 based on keyword usage, local relevance, CTA presence, and readability."""
 
 REVIEW_RESPONSE_SYSTEM = """You are a reputation management expert for local businesses.
 Draft a professional, empathetic response to a customer review.
@@ -5097,13 +5099,13 @@ Return format: {"response": "the response text here"}"""
 
 CONTENT_GENERATE_SYSTEM = """You are an expert local SEO content writer.
 Generate high-quality, SEO-optimized content for the specified page type.
-Include the target keyword naturally throughout. Optimize for local search intent.
-For page rewrites: Improve existing thin content to 800+ words with proper heading structure.
-For service area pages: Create location-specific content (600-800 words) with local references.
-For FAQ answers: Write comprehensive, authoritative answers (100-200 words each).
-For blog articles: Write engaging, informative articles (800-1200 words) with proper H2/H3 structure.
+Include the target keyword naturally throughout. Reference the business name, city, and services.
+For page_rewrite: Full rewrite of the page, 1500+ words, proper H2/H3 heading structure, strong local SEO signals.
+For service_area_page: Location-specific service page (800 words) with local references, landmarks, and service details.
+For faq_answer: Schema-ready FAQ answer, 100-150 words, authoritative and concise.
+For blog_article: Full article, 1200-2000 words, SEO-optimized with H2/H3 structure, internal linking suggestions.
 You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
-Return format: {"content": "the content here", "word_count": 850, "meta_title": "SEO title", "meta_description": "155-char description"}"""
+Return format: {"content": "the content here", "word_count": 850, "meta_title": "SEO title under 60 chars", "meta_description": "155-char description with keyword", "suggested_title": "Page title suggestion", "keyword_density": 1.5}"""
 
 
 class CalendarRequest(BaseModel):
