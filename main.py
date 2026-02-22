@@ -1412,7 +1412,7 @@ async def keyword_research_agent(request: AuditRequest, secondary_keywords: list
     if secondary_keywords:
         prompt += f"\n\nAlso analyze these related keywords detected from the website: {', '.join(secondary_keywords)}"
 
-    recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=2500)
+    recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=4000)
 
     return {
         "agent": "keyword_research",
@@ -3480,14 +3480,33 @@ def build_seo_tasks(quick_wins: list[dict], pillars: dict) -> list[dict]:
 # TOOL-PAGE BUILDERS — flatten agent outputs into the frontend-ready format
 # =============================================================================
 
+
+def _resolve_agent_recs(agent_data: dict, key: str = "recommendations") -> dict:
+    """Get an agent's recommendations, repairing raw_response fallback if needed."""
+    recs = agent_data.get(key, {})
+    if not isinstance(recs, dict):
+        return {}
+    if "raw_response" in recs and len(recs) == 1:
+        raw = recs["raw_response"]
+        if isinstance(raw, str):
+            repaired = _repair_truncated_json(raw)
+            if isinstance(repaired, dict):
+                return repaired
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return recs
+
+
 def build_gmb_data(agents: dict) -> dict:
     """Build gmb_data section from gbp_audit + citation_builder + local_seo agents."""
     gbp = agents.get("gbp_audit", {})
     cit = agents.get("citation_builder", {})
     local = agents.get("local_seo", {})
-    gbp_a = gbp.get("analysis", {})
-    cit_plan = cit.get("plan", {})
-    local_rec = local.get("recommendations", {})
+    gbp_a = _resolve_agent_recs(gbp, "analysis")
+    cit_plan = _resolve_agent_recs(cit, "plan")
+    local_rec = _resolve_agent_recs(local)
 
     # --- GBP Score ---
     gbp_score = int(gbp_a.get("gbp_score", 0))
@@ -3640,7 +3659,7 @@ def _volume_to_int(vol) -> int:
 def build_keyword_data(agents: dict, auto_detected: dict | None) -> dict:
     """Build keyword_data section from keyword_research agent."""
     kw = agents.get("keyword_research", {})
-    recs = kw.get("recommendations", {})
+    recs = _resolve_agent_recs(kw)
 
     primary = recs.get("primary_keyword", kw.get("keyword", ""))
 
@@ -3680,16 +3699,29 @@ def build_keyword_data(agents: dict, auto_detected: dict | None) -> dict:
     other_items = [k for k in keywords if not k.get("is_primary")]
     keywords = primary_items + other_items
 
-    # --- Keyword gaps from keyword_gap ---
+    # --- Keyword gaps from keyword_gap OR competitor_keywords_we_miss ---
     keyword_gaps = []
-    for gap in recs.get("keyword_gap", []):
+    gap_list = recs.get("keyword_gap", [])
+    if not gap_list:
+        # Fallback: competitor_keywords_we_miss (may be list of strings or dicts)
+        gap_list = recs.get("competitor_keywords_we_miss", [])
+    for gap in gap_list:
+        if isinstance(gap, str):
+            keyword_gaps.append({
+                "keyword": gap,
+                "volume": _volume_to_int("medium"),
+                "difficulty": _difficulty_to_int("medium"),
+                "competitor": "",
+                "competitor_position": None,
+                "opportunity": "Create page",
+            })
+            continue
         if not isinstance(gap, dict):
             continue
         kw_text = gap.get("keyword", "")
-        vol = gap.get("estimated_volume", "medium")
+        vol = gap.get("estimated_volume", gap.get("estimated_monthly_searches", "medium"))
         diff = gap.get("difficulty", "medium")
         action = gap.get("action", "Create page")
-        category = gap.get("category", "missing")
         keyword_gaps.append({
             "keyword": kw_text,
             "volume": _volume_to_int(vol),
@@ -3710,8 +3742,8 @@ def build_backlink_data(agents: dict) -> dict:
     """Build backlink_data section from backlink_analysis + link_building agents."""
     bl = agents.get("backlink_analysis", {})
     lb = agents.get("link_building", {})
-    bl_rec = bl.get("recommendations", {})
-    lb_rec = lb.get("recommendations", {})
+    bl_rec = _resolve_agent_recs(bl)
+    lb_rec = _resolve_agent_recs(lb)
 
     da_obj = bl_rec.get("domain_authority", {})
     bp = bl_rec.get("backlink_profile", {})
@@ -3799,11 +3831,11 @@ def build_content_data(agents: dict) -> dict:
     ai = agents.get("ai_seo", {})
     rewriter = agents.get("content_rewriter", {})
 
-    op_rec = op.get("recommendations", {})
-    kw_rec = kw.get("recommendations", {})
-    local_rec = local.get("recommendations", {})
-    ai_analysis = ai.get("analysis", {})
-    rewriter_rec = rewriter.get("recommendations", {})
+    op_rec = _resolve_agent_recs(op)
+    kw_rec = _resolve_agent_recs(kw)
+    local_rec = _resolve_agent_recs(local)
+    ai_analysis = _resolve_agent_recs(ai, "analysis")
+    rewriter_rec = _resolve_agent_recs(rewriter)
 
     # --- Homepage words ---
     current = op_rec.get("current_analysis", {})
