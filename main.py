@@ -427,6 +427,16 @@ def extract_json(text: str) -> dict | list:
     return {"raw_response": text}
 
 
+def _is_claude_error(result) -> bool:
+    """Check if a call_claude() result is an error dict rather than real data."""
+    if isinstance(result, dict):
+        if "error" in result and len(result) == 1:
+            return True
+        if "raw_response" in result and len(result) == 1:
+            return True
+    return False
+
+
 def _repair_truncated_json(fragment: str) -> dict | list | None:
     """Attempt to repair JSON truncated by max_tokens cutoff."""
     # Trim trailing incomplete value (e.g. cut-off string or number)
@@ -890,7 +900,7 @@ async def fetch_robots_and_sitemap(base_url: str) -> dict:
         if not isinstance(robots_resp, Exception) and robots_resp.status_code == 200:
             content = robots_resp.text
             result["robots_txt"]["exists"] = True
-            result["robots_txt"]["content_preview"] = content[:300]
+            result["robots_txt"]["content_preview"] = content[:300].replace("\r", "").replace("\t", " ")
             # Check if it blocks /
             lines_lower = content.lower()
             result["robots_txt"]["blocks_important"] = (
@@ -1173,6 +1183,11 @@ async def call_claude(
         except Exception as e:
             last_error = e
             err_str = str(e)
+            # Don't retry on billing/credit errors — they'll never succeed
+            is_billing = "credit balance" in err_str.lower() or "billing" in err_str.lower()
+            if is_billing:
+                logger.error(f"Claude billing error (not retrying): {e}")
+                break
             is_rate_limit = "rate_limit" in err_str.lower() or "429" in err_str
             wait = 30 if is_rate_limit else 2 * attempt
             logger.warning(
@@ -3182,15 +3197,28 @@ def build_structured_quick_wins(agents: dict) -> list[dict]:
         if isinstance(win, str) and win:
             _add(win, win, "backlinks", "low", "Improve domain authority", "1-2 weeks")
 
-    # Fallback
-    if not wins:
-        wins = [
-            {"rank": 1, "title": "Complete Google Business Profile optimisation", "description": "Fill all GBP fields, add 40+ photos, select the right primary category.", "pillar": "local_seo", "priority": "high", "impact": "Map Pack visibility", "time_estimate": "2 hours"},
-            {"rank": 2, "title": "Update meta title and description with target keyword", "description": "Write a compelling 60-char title and 155-char description with your primary keyword.", "pillar": "website_seo", "priority": "high", "impact": "+20% CTR from search", "time_estimate": "10 min"},
-            {"rank": 3, "title": "Build citations on top local directories", "description": "Submit your business to Google, Yelp, BBB, and industry-specific directories.", "pillar": "local_seo", "priority": "high", "impact": "+10-15 local authority", "time_estimate": "1 hour each"},
-            {"rank": 4, "title": "Add internal links between service pages", "description": "Link related service pages together to distribute link equity.", "pillar": "website_seo", "priority": "medium", "impact": "Better site structure", "time_estimate": "30 min"},
+    # Fallback — provide meaningful default quick wins when agents return errors
+    if len(wins) < 5:
+        defaults = [
+            {"title": "Complete Google Business Profile optimisation", "description": "Fill all GBP fields, add 40+ photos, select the right primary category.", "pillar": "local_seo", "priority": "high", "impact": "Map Pack visibility", "time_estimate": "2 hours"},
+            {"title": "Update meta title and description with target keyword", "description": "Write a compelling 60-char title and 155-char description with your primary keyword.", "pillar": "website_seo", "priority": "high", "impact": "+20% CTR from search", "time_estimate": "10 min"},
+            {"title": "Build citations on top local directories", "description": "Submit your business to Google, Yelp, BBB, and industry-specific directories.", "pillar": "local_seo", "priority": "high", "impact": "+10-15 local authority", "time_estimate": "1 hour each"},
+            {"title": "Add internal links between service pages", "description": "Link related service pages together to distribute link equity.", "pillar": "website_seo", "priority": "medium", "impact": "Better site structure", "time_estimate": "30 min"},
+            {"title": "Add FAQ section with structured data markup", "description": "Create a FAQ page with FAQPage schema to appear in AI answers and People Also Ask.", "pillar": "ai_seo", "priority": "high", "impact": "AI overview visibility", "time_estimate": "1-2 hours"},
+            {"title": "Get 5 new Google reviews this month", "description": "Send review request emails to recent customers using a simple template.", "pillar": "local_seo", "priority": "high", "impact": "+15% local trust signals", "time_estimate": "30 min setup"},
+            {"title": "Fix missing alt text on images", "description": "Add descriptive alt attributes to all images for accessibility and SEO.", "pillar": "website_seo", "priority": "medium", "impact": "Image search + accessibility", "time_estimate": "30-60 min"},
+            {"title": "Build 3 guest post backlinks", "description": "Write guest articles for local blogs or industry publications to earn quality backlinks.", "pillar": "backlinks", "priority": "medium", "impact": "+5-10 DA over 3 months", "time_estimate": "2-3 hours each"},
+            {"title": "Create service area pages for each location", "description": "Build dedicated pages for each service area to rank for local + service keywords.", "pillar": "local_seo", "priority": "medium", "impact": "Rank in nearby cities", "time_estimate": "1-2 hours each"},
+            {"title": "Add LocalBusiness schema markup", "description": "Implement JSON-LD structured data for your business name, address, phone, hours, and services.", "pillar": "ai_seo", "priority": "medium", "impact": "Rich snippets + AI visibility", "time_estimate": "30 min"},
         ]
-        return wins
+        existing_titles = {w["title"][:60].lower() for w in wins}
+        for d in defaults:
+            if len(wins) >= 10:
+                break
+            if d["title"][:60].lower() not in existing_titles:
+                d["rank"] = len(wins) + 1
+                wins.append(d)
+                existing_titles.add(d["title"][:60].lower())
 
     for i, win in enumerate(wins[:10]):
         win["rank"] = i + 1
@@ -4150,6 +4178,17 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
 
         # Replace any exceptions with empty dicts so the rest of the report still builds
         results = [r if not isinstance(r, Exception) else {} for r in results]
+
+        # Mark agents whose Claude calls failed (error dicts in recommendations/analysis)
+        # so downstream score builders and the frontend can distinguish partial from real data
+        for res in [keyword_results] + list(results):
+            if not isinstance(res, dict):
+                continue
+            for key in ("recommendations", "analysis", "plan"):
+                if key in res and _is_claude_error(res[key]):
+                    res["status"] = "error"
+                    res["_claude_error"] = res[key].get("error", "Unknown error")
+                    break
 
         (
             on_page_results,
