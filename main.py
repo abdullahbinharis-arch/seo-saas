@@ -4437,6 +4437,149 @@ def export_audit_pdf(audit_id: str, current_user: CurrentUser = Depends(get_curr
 
 
 # =============================================================================
+# Content Generation Endpoints (Post Creator & Content Writer)
+# =============================================================================
+
+# ── System prompts for content generation ─────────────────────────────────────
+
+CALENDAR_SYSTEM = """You are a local SEO content strategist. Generate a 4-week content calendar for a local business.
+Each week has 3 posts: a Google Business Profile (GBP) post, a social media post, and a blog intro.
+All content should be optimized for the business's primary keyword and location.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Return format: {"weeks": [{"label": "Week 1", "posts": [{"type": "GBP Post", "title": "..."}, {"type": "Social Post", "title": "..."}, {"type": "Blog Intro", "title": "..."}]}]}"""
+
+POST_GENERATE_SYSTEM = """You are a local SEO content writer specializing in social media and Google Business Profile posts.
+Write engaging, concise content optimized for the given post type. Include relevant local keywords naturally.
+For GBP posts: 150-300 words, include a call-to-action.
+For social posts: 100-200 words, engaging and shareable.
+For blog intros: 200-400 words, hook the reader and include the primary keyword.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Return format: {"content": "the post content here", "hashtags": ["#relevant", "#hashtags"]}"""
+
+REVIEW_RESPONSE_SYSTEM = """You are a reputation management expert for local businesses.
+Draft a professional, empathetic response to a customer review.
+For positive reviews (4-5 stars): Thank them warmly, mention specific details from their review, invite them back.
+For neutral reviews (3 stars): Acknowledge their feedback, address concerns, offer to improve.
+For negative reviews (1-2 stars): Apologize sincerely, address specifics, offer resolution, take conversation offline.
+Never be defensive. Keep responses 50-150 words.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Return format: {"response": "the response text here"}"""
+
+CONTENT_GENERATE_SYSTEM = """You are an expert local SEO content writer.
+Generate high-quality, SEO-optimized content for the specified page type.
+Include the target keyword naturally throughout. Optimize for local search intent.
+For page rewrites: Improve existing thin content to 800+ words with proper heading structure.
+For service area pages: Create location-specific content (600-800 words) with local references.
+For FAQ answers: Write comprehensive, authoritative answers (100-200 words each).
+For blog articles: Write engaging, informative articles (800-1200 words) with proper H2/H3 structure.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Return format: {"content": "the content here", "word_count": 850, "meta_title": "SEO title", "meta_description": "155-char description"}"""
+
+
+class CalendarRequest(BaseModel):
+    keyword: str = ""
+    business_name: Optional[str] = None
+    business_type: Optional[str] = None
+    location: str = "Toronto, Canada"
+
+
+class PostGenerateRequest(BaseModel):
+    topic: str
+    post_type: str = "GBP Post"
+    keyword: str = ""
+    business_name: Optional[str] = None
+    business_type: Optional[str] = None
+    location: str = "Toronto, Canada"
+
+
+class ReviewResponseRequest(BaseModel):
+    review_text: str
+    rating: int = 5
+    business_name: Optional[str] = None
+    business_type: Optional[str] = None
+
+
+class ContentGenerateRequest(BaseModel):
+    page_type: str  # page_rewrite, service_area_page, faq_answer, blog_article
+    keyword: str = ""
+    target_url: str = ""
+    business_name: Optional[str] = None
+    business_type: Optional[str] = None
+    location: str = "Toronto, Canada"
+    context: Optional[str] = None  # extra context (area name, question, topic, etc.)
+
+
+@app.post("/api/generate-calendar")
+async def generate_calendar(
+    request: CalendarRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    prompt = (
+        f"Create a 4-week content calendar for {request.business_name or 'a local business'} "
+        f"({request.business_type or 'local service'}) in {request.location}. "
+        f"Primary keyword: \"{request.keyword}\". "
+        f"Each week should have 3 posts targeting different aspects of the business."
+    )
+    result = await call_claude(CALENDAR_SYSTEM, prompt, max_tokens=2000)
+    return result if isinstance(result, dict) else {"weeks": []}
+
+
+@app.post("/api/generate-post")
+async def generate_post(
+    request: PostGenerateRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    prompt = (
+        f"Write a {request.post_type} about: \"{request.topic}\"\n"
+        f"Business: {request.business_name or 'Local Business'} ({request.business_type or 'service'})\n"
+        f"Location: {request.location}\n"
+        f"Primary keyword: \"{request.keyword}\"\n"
+        f"Make it engaging, locally relevant, and SEO-friendly."
+    )
+    result = await call_claude(POST_GENERATE_SYSTEM, prompt, max_tokens=1500)
+    return result if isinstance(result, dict) else {"content": str(result)}
+
+
+@app.post("/api/generate-review-response")
+async def generate_review_response(
+    request: ReviewResponseRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    star_label = (
+        "positive" if request.rating >= 4
+        else "neutral" if request.rating == 3
+        else "negative"
+    )
+    prompt = (
+        f"Write a {star_label} review response for {request.business_name or 'our business'} "
+        f"({request.business_type or 'local service'}).\n"
+        f"Rating: {request.rating}/5 stars\n"
+        f"Customer review: \"{request.review_text}\""
+    )
+    result = await call_claude(REVIEW_RESPONSE_SYSTEM, prompt, max_tokens=800)
+    return result if isinstance(result, dict) else {"response": str(result)}
+
+
+@app.post("/api/generate-content")
+async def generate_content(
+    request: ContentGenerateRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    page_label = request.page_type.replace("_", " ").title()
+    prompt = (
+        f"Generate a {page_label} for {request.business_name or 'a local business'} "
+        f"({request.business_type or 'service'}) in {request.location}.\n"
+        f"Target keyword: \"{request.keyword}\"\n"
+        f"Target URL: {request.target_url}\n"
+    )
+    if request.context:
+        prompt += f"Additional context: {request.context}\n"
+    prompt += "Write comprehensive, SEO-optimized content."
+    result = await call_claude(CONTENT_GENERATE_SYSTEM, prompt, max_tokens=3000)
+    return result if isinstance(result, dict) else {"content": str(result)}
+
+
+# =============================================================================
 # Health & info
 # =============================================================================
 
