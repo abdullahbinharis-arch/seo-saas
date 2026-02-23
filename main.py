@@ -6026,6 +6026,103 @@ async def manual_keyword_research(
 
 
 # =============================================================================
+# Keyword Gap Analysis (on-demand competitor comparison)
+# =============================================================================
+
+KEYWORD_GAP_SYSTEM = (
+    "You are a local SEO keyword gap analyst. You compare a competitor's website content "
+    "against a target business to identify keyword opportunities the target is missing. "
+    "Respond with valid JSON only — no markdown fences, no extra text."
+)
+
+
+@app.post("/api/keyword-gap")
+async def keyword_gap_analysis(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Scrape a competitor URL and identify keyword gaps vs the target business."""
+    competitor_url = (body.get("competitor_url") or "").strip()
+    target_url = (body.get("target_url") or "").strip()
+    keyword = (body.get("keyword") or "").strip()
+    location = (body.get("location") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+
+    if not competitor_url:
+        raise HTTPException(status_code=400, detail="competitor_url is required")
+
+    # Scrape competitor page
+    comp_data = await scrape_page(competitor_url)
+    if not comp_data.get("success"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not scrape competitor URL: {comp_data.get('error', 'unknown error')}",
+        )
+
+    prompt = (
+        f"Compare this competitor website against a {business_type} "
+        f"{'in ' + location if location else ''} "
+        f"{'targeting \"' + keyword + '\"' if keyword else ''}.\n\n"
+        f"COMPETITOR PAGE DATA:\n"
+        f"- URL: {competitor_url}\n"
+        f"- Title: {comp_data.get('title', 'N/A')}\n"
+        f"- H1: {comp_data.get('h1', 'N/A')}\n"
+        f"- Meta description: {comp_data.get('meta_description', 'N/A')}\n"
+        f"- Headings: {json.dumps(comp_data.get('headings', [])[:15])}\n"
+        f"- Word count: {comp_data.get('word_count', 0)}\n"
+        f"- Content preview: {comp_data.get('content', '')[:2000]}\n\n"
+        f"TARGET BUSINESS:\n"
+        f"- URL: {target_url or 'not provided'}\n"
+        f"- Type: {business_type}\n"
+        f"- Location: {location or 'not provided'}\n"
+        f"- Primary keyword: {keyword or 'not provided'}\n\n"
+        f"Identify keywords the competitor targets that the target business likely misses.\n\n"
+        f"Return JSON with EXACTLY these keys:\n"
+        f'{{\n'
+        f'  "competitor_url": "{competitor_url}",\n'
+        f'  "competitor_title": "<title from scraped data>",\n'
+        f'  "estimated_da": <integer 0-100, estimate domain authority>,\n'
+        f'  "keywords_found": <integer, total keywords identified on competitor page>,\n'
+        f'  "gaps": [\n'
+        f'    {{\n'
+        f'      "keyword": "...",\n'
+        f'      "volume_estimate": <integer>,\n'
+        f'      "difficulty_estimate": <integer 0-100>,\n'
+        f'      "competitor_position": "strong|moderate|weak",\n'
+        f'      "opportunity": "Create page|Optimize existing|Write blog post|Add to service page",\n'
+        f'      "intent": "commercial|informational|transactional|navigational"\n'
+        f'    }}\n'
+        f'  ],\n'
+        f'  "overlap_keywords": ["keywords both sites likely target"],\n'
+        f'  "summary": "One paragraph analysis of the competitive gap"\n'
+        f'}}\n\n'
+        f"Rules:\n"
+        f"- gaps: provide 10-15 keyword gaps, ranked by opportunity value\n"
+        f"- estimated_da: realistic estimate based on content quality and site signals\n"
+        f"- overlap_keywords: 5-10 keywords both sites likely compete on\n"
+        f"- Be specific to {business_type} keywords, not generic terms"
+    )
+
+    result = await call_claude(KEYWORD_GAP_SYSTEM, prompt, max_tokens=2500)
+
+    if isinstance(result, dict) and "error" not in result:
+        result.setdefault("competitor_url", competitor_url)
+        result.setdefault("competitor_title", comp_data.get("title", ""))
+        return result
+
+    return {
+        "competitor_url": competitor_url,
+        "competitor_title": comp_data.get("title", ""),
+        "estimated_da": 0,
+        "keywords_found": 0,
+        "gaps": [],
+        "overlap_keywords": [],
+        "summary": "Analysis could not be completed.",
+        "error": result.get("error") if isinstance(result, dict) else "Could not parse result",
+    }
+
+
+# =============================================================================
 # Health & info
 # =============================================================================
 
