@@ -6173,6 +6173,137 @@ async def generate_guest_post(
     return {"content": str(result), "platform": platform, "word_count": 0}
 
 
+# =============================================================================
+# Outreach Email Generator + Link Opportunity Checker (Prompt 8)
+# =============================================================================
+
+OUTREACH_SYSTEM = (
+    "You are an expert SEO outreach specialist. You write personalized, "
+    "professional outreach emails that get responses and earn backlinks. "
+    "Respond with valid JSON only — no markdown fences, no extra text."
+)
+
+LINK_CHECK_SYSTEM = (
+    "You are a local SEO link building analyst. You analyse websites to determine "
+    "if and how a local business could earn a backlink from them. "
+    "Respond with valid JSON only — no markdown fences, no extra text."
+)
+
+
+@app.post("/api/generate-outreach")
+async def generate_outreach(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Generate a personalized outreach email for a link building target."""
+    target_site = (body.get("target_site") or "").strip()
+    link_type = (body.get("link_type") or "general").strip()
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+    target_url = (body.get("target_url") or "").strip()
+    context = (body.get("context") or "").strip()
+
+    if not target_site:
+        raise HTTPException(status_code=400, detail="target_site is required")
+
+    prompt = (
+        f"Write a personalized outreach email to get a backlink from: {target_site}\n\n"
+        f"Link type: {link_type}\n"
+        f"Business: {business_name or 'Local Business'} ({business_type})\n"
+        f"Location: {location}\n"
+        f"Our website: {target_url or 'our website'}\n"
+        f"{f'Context: {context}' if context else ''}\n\n"
+        f"Return JSON:\n"
+        f'{{\n'
+        f'  "email_subject": "<specific subject line mentioning their site>",\n'
+        f'  "email_body": "<2-3 paragraphs, 60-100 words, professional, mentions their site by name, ends with our URL>",\n'
+        f'  "follow_up": "<shorter follow-up email for 5 days later, 30-50 words>"\n'
+        f'}}\n\n'
+        f"Rules:\n"
+        f"- Reference their website/organization specifically\n"
+        f"- Explain the value proposition (why linking to us benefits their audience)\n"
+        f"- Keep it concise and professional — ready to send with zero editing\n"
+        f"- No generic 'Dear Sir/Madam' — use context clues to personalize"
+    )
+
+    result = await call_claude(OUTREACH_SYSTEM, prompt, max_tokens=1000)
+    if isinstance(result, dict):
+        return result
+    return {"email_subject": "", "email_body": str(result), "follow_up": ""}
+
+
+@app.post("/api/check-link-opportunity")
+async def check_link_opportunity(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Analyse a website URL and suggest how to earn a backlink from it."""
+    check_url = (body.get("url") or "").strip()
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+    target_url = (body.get("target_url") or "").strip()
+
+    if not check_url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    # Scrape the target
+    page_data = await scrape_page(check_url)
+    if not page_data.get("success"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not scrape URL: {page_data.get('error', 'unknown error')}",
+        )
+
+    prompt = (
+        f"Analyse this website for link building opportunity for a {business_type} in {location}.\n\n"
+        f"TARGET SITE:\n"
+        f"- URL: {check_url}\n"
+        f"- Title: {page_data.get('title', 'N/A')}\n"
+        f"- H1: {page_data.get('h1', 'N/A')}\n"
+        f"- Meta: {page_data.get('meta_description', 'N/A')}\n"
+        f"- Word count: {page_data.get('word_count', 0)}\n"
+        f"- Content: {page_data.get('content', '')[:1500]}\n\n"
+        f"OUR BUSINESS:\n"
+        f"- Name: {business_name or 'Local Business'}\n"
+        f"- Type: {business_type}\n"
+        f"- Location: {location}\n"
+        f"- Website: {target_url or 'our website'}\n\n"
+        f"Return JSON:\n"
+        f'{{\n'
+        f'  "opportunity_score": <0-100 int, how likely we can get a link>,\n'
+        f'  "site_type": "blog|directory|news|resource|business|government|other",\n'
+        f'  "estimated_da": <0-100 int>,\n'
+        f'  "link_strategy": "<specific strategy to earn a link from this site>",\n'
+        f'  "approach": "guest-post|resource-listing|directory-submission|partnership|content-mention|broken-link",\n'
+        f'  "difficulty": "easy|medium|hard",\n'
+        f'  "pitch_angle": "<specific angle for reaching out to this site>",\n'
+        f'  "relevance": "<why this link would be valuable for a {business_type}>"\n'
+        f'}}'
+    )
+
+    result = await call_claude(LINK_CHECK_SYSTEM, prompt, max_tokens=1200)
+    if isinstance(result, dict) and "error" not in result:
+        result.setdefault("url", check_url)
+        result.setdefault("title", page_data.get("title", ""))
+        return result
+
+    return {
+        "url": check_url,
+        "title": page_data.get("title", ""),
+        "opportunity_score": 0,
+        "site_type": "other",
+        "estimated_da": 0,
+        "link_strategy": "Could not analyze this site.",
+        "approach": "other",
+        "difficulty": "hard",
+        "pitch_angle": "",
+        "relevance": "",
+        "error": result.get("error") if isinstance(result, dict) else "Could not parse result",
+    }
+
+
 @app.post("/api/generate-content")
 async def generate_content(
     request: ContentGenerateRequest,
