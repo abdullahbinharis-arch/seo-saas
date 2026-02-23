@@ -73,7 +73,7 @@ anthropic_client = AsyncAnthropic()           # reads ANTHROPIC_API_KEY from env
 # Database
 # ---------------------------------------------------------------------------
 
-from database import Audit, User, SessionLocal, init_db
+from database import Audit, Profile, User, SessionLocal, init_db
 from pdf_export import build_pdf
 
 # ---------------------------------------------------------------------------
@@ -170,6 +170,7 @@ class AuditRequest(BaseModel):
     business_name: Optional[str] = None
     business_type: Optional[str] = None
     user_id: Optional[str] = None
+    profile_id: Optional[str] = None
     include_blog: bool = False  # opt-in: adds ~40s but generates a full blog post
 
     @field_validator("keyword")
@@ -279,6 +280,26 @@ class OAuthSyncRequest(BaseModel):
     name: Optional[str] = None
 
 
+class ProfileCreateRequest(BaseModel):
+    business_name: str
+    website_url: str
+    business_category: Optional[str] = None
+    services: Optional[list[str]] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    nap_data: Optional[dict] = None
+
+
+class ProfileUpdateRequest(BaseModel):
+    business_name: Optional[str] = None
+    website_url: Optional[str] = None
+    business_category: Optional[str] = None
+    services: Optional[list[str]] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    nap_data: Optional[dict] = None
+
+
 # =============================================================================
 # Auth endpoints
 # =============================================================================
@@ -351,6 +372,269 @@ def auth_oauth_sync(body: OAuthSyncRequest):
             db.commit()
         token = _create_token(user.id, user.email)
         return {"id": user.id, "email": user.email, "access_token": token}
+    finally:
+        db.close()
+
+
+# =============================================================================
+# Profile endpoints
+# =============================================================================
+
+def _profile_to_dict(p: Profile) -> dict:
+    """Serialize a Profile ORM object to a JSON-safe dict."""
+    services = None
+    if p.services:
+        try:
+            services = json.loads(p.services)
+        except Exception:
+            services = []
+    nap = None
+    if p.nap_data:
+        try:
+            nap = json.loads(p.nap_data)
+        except Exception:
+            nap = {}
+    return {
+        "id": p.id,
+        "user_id": p.user_id,
+        "business_name": p.business_name,
+        "website_url": p.website_url,
+        "business_category": p.business_category,
+        "services": services or [],
+        "country": p.country,
+        "city": p.city,
+        "nap_data": nap,
+        "is_active": p.is_active,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+@app.post("/profiles", status_code=201)
+def create_profile(body: ProfileCreateRequest, current_user: CurrentUser = Depends(get_current_user)):
+    """Create a new business profile for the authenticated user."""
+    db = SessionLocal()
+    try:
+        profile = Profile(
+            id=str(uuid.uuid4()),
+            user_id=current_user.id,
+            business_name=body.business_name,
+            website_url=body.website_url,
+            business_category=body.business_category,
+            services=json.dumps(body.services) if body.services else None,
+            country=body.country,
+            city=body.city,
+            nap_data=json.dumps(body.nap_data) if body.nap_data else None,
+        )
+        db.add(profile)
+        db.commit()
+        db.refresh(profile)
+        return _profile_to_dict(profile)
+    finally:
+        db.close()
+
+
+@app.get("/profiles")
+def list_profiles(current_user: CurrentUser = Depends(get_current_user)):
+    """List the authenticated user's active profiles."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Profile)
+            .filter(Profile.user_id == current_user.id, Profile.is_active == True)
+            .order_by(Profile.created_at.desc())
+            .all()
+        )
+        result = []
+        for p in rows:
+            d = _profile_to_dict(p)
+            # Add audit count + latest audit meta
+            audit_count = db.query(Audit).filter(Audit.profile_id == p.id).count()
+            d["audit_count"] = audit_count
+            latest = (
+                db.query(Audit)
+                .filter(Audit.profile_id == p.id)
+                .order_by(Audit.created_at.desc())
+                .first()
+            )
+            d["latest_audit"] = {
+                "id": latest.id,
+                "version": latest.version,
+                "keyword": latest.keyword,
+                "status": latest.status,
+                "created_at": latest.created_at.isoformat() if latest.created_at else None,
+            } if latest else None
+            result.append(d)
+        return result
+    finally:
+        db.close()
+
+
+@app.get("/profiles/{profile_id}")
+def get_profile(profile_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Get a single profile with audit count and latest audit meta."""
+    db = SessionLocal()
+    try:
+        p = db.query(Profile).filter(
+            Profile.id == profile_id,
+            Profile.user_id == current_user.id,
+        ).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        d = _profile_to_dict(p)
+        audit_count = db.query(Audit).filter(Audit.profile_id == p.id).count()
+        d["audit_count"] = audit_count
+        latest = (
+            db.query(Audit)
+            .filter(Audit.profile_id == p.id)
+            .order_by(Audit.created_at.desc())
+            .first()
+        )
+        d["latest_audit"] = {
+            "id": latest.id,
+            "version": latest.version,
+            "keyword": latest.keyword,
+            "status": latest.status,
+            "created_at": latest.created_at.isoformat() if latest.created_at else None,
+        } if latest else None
+        return d
+    finally:
+        db.close()
+
+
+@app.patch("/profiles/{profile_id}")
+def update_profile(profile_id: str, body: ProfileUpdateRequest, current_user: CurrentUser = Depends(get_current_user)):
+    """Partial update of a profile."""
+    db = SessionLocal()
+    try:
+        p = db.query(Profile).filter(
+            Profile.id == profile_id,
+            Profile.user_id == current_user.id,
+        ).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        if body.business_name is not None:
+            p.business_name = body.business_name
+        if body.website_url is not None:
+            p.website_url = body.website_url
+        if body.business_category is not None:
+            p.business_category = body.business_category
+        if body.services is not None:
+            p.services = json.dumps(body.services)
+        if body.country is not None:
+            p.country = body.country
+        if body.city is not None:
+            p.city = body.city
+        if body.nap_data is not None:
+            p.nap_data = json.dumps(body.nap_data)
+        p.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(p)
+        return _profile_to_dict(p)
+    finally:
+        db.close()
+
+
+@app.delete("/profiles/{profile_id}")
+def delete_profile(profile_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Soft-delete a profile (sets is_active=False)."""
+    db = SessionLocal()
+    try:
+        p = db.query(Profile).filter(
+            Profile.id == profile_id,
+            Profile.user_id == current_user.id,
+        ).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        p.is_active = False
+        p.updated_at = datetime.utcnow()
+        db.commit()
+        return {"status": "deleted", "id": profile_id}
+    finally:
+        db.close()
+
+
+@app.get("/profiles/{profile_id}/audits")
+def list_profile_audits(profile_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """List all audits for a profile (version descending, metadata only)."""
+    db = SessionLocal()
+    try:
+        # Verify ownership
+        p = db.query(Profile).filter(
+            Profile.id == profile_id,
+            Profile.user_id == current_user.id,
+        ).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        rows = (
+            db.query(Audit)
+            .filter(Audit.profile_id == profile_id)
+            .order_by(Audit.version.desc())
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "version": r.version,
+                "keyword": r.keyword,
+                "target_url": r.target_url,
+                "location": r.location,
+                "status": r.status,
+                "business_name": r.business_name,
+                "business_type": r.business_type,
+                "pages_crawled": r.pages_crawled,
+                "api_cost": r.api_cost,
+                "execution_time": r.execution_time,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/profiles/{profile_id}/audits/latest")
+def get_profile_latest_audit(profile_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Return full results of the most recent audit for a profile."""
+    db = SessionLocal()
+    try:
+        p = db.query(Profile).filter(
+            Profile.id == profile_id,
+            Profile.user_id == current_user.id,
+        ).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        latest = (
+            db.query(Audit)
+            .filter(Audit.profile_id == profile_id)
+            .order_by(Audit.created_at.desc())
+            .first()
+        )
+        if not latest:
+            raise HTTPException(status_code=404, detail="No audits found for this profile")
+        return json.loads(latest.results_json)
+    finally:
+        db.close()
+
+
+@app.get("/profiles/{profile_id}/audits/{audit_id}")
+def get_profile_audit(profile_id: str, audit_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Return full results of a specific audit for a profile."""
+    db = SessionLocal()
+    try:
+        p = db.query(Profile).filter(
+            Profile.id == profile_id,
+            Profile.user_id == current_user.id,
+        ).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        row = db.query(Audit).filter(
+            Audit.id == audit_id,
+            Audit.profile_id == profile_id,
+        ).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Audit not found")
+        return json.loads(row.results_json)
     finally:
         db.close()
 
@@ -4676,6 +4960,42 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
     start = time.time()
     logger.info(f"[{audit_id}] Full audit starting for '{request.keyword}' → {request.target_url}")
 
+    # Profile resolution — populate request fields from profile if provided
+    profile_id = request.profile_id
+    version = None
+    if profile_id and current_user:
+        db = SessionLocal()
+        try:
+            profile = db.query(Profile).filter(
+                Profile.id == profile_id,
+                Profile.user_id == current_user.id,
+            ).first()
+            if profile:
+                # Fill empty request fields from profile
+                if not request.target_url or request.target_url == "":
+                    request.target_url = profile.website_url
+                if not request.business_name:
+                    request.business_name = profile.business_name
+                if not request.business_type and profile.business_category:
+                    request.business_type = profile.business_category
+                if request.location == "Toronto, Canada" and profile.city:
+                    loc_parts = [profile.city]
+                    if profile.country:
+                        loc_parts.append(profile.country)
+                    request.location = ", ".join(loc_parts)
+                # Compute next version number
+                from sqlalchemy import func
+                max_ver = db.query(func.max(Audit.version)).filter(
+                    Audit.profile_id == profile_id
+                ).scalar()
+                version = (max_ver or 0) + 1
+                logger.info(f"[{audit_id}] Profile {profile_id} → version {version}")
+            else:
+                logger.warning(f"[{audit_id}] Profile {profile_id} not found or not owned by user")
+                profile_id = None
+        finally:
+            db.close()
+
     auto_detected: dict | None = None
     secondary_keywords: list[str] | None = None
 
@@ -4835,6 +5155,8 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
 
         report = {
             "audit_id": audit_id,
+            "profile_id": profile_id,
+            "version": version,
             "business_name": request.business_name or "",
             "business_type": request.business_type or "other",
             "keyword": request.keyword,
@@ -4876,7 +5198,7 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
         # Persist to DB — run in thread pool so we don't block the event loop
         loop = asyncio.get_event_loop()
         user_id_for_db = current_user.id if current_user else None
-        await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed, user_id_for_db)
+        await loop.run_in_executor(None, _save_audit, audit_id, request, report, elapsed, user_id_for_db, profile_id, version)
 
         # Send audit summary email (non-blocking — failure won't affect response)
         if current_user:
@@ -4891,7 +5213,7 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
         raise
 
 
-def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: str = None) -> None:
+def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: str = None, profile_id: str = None, version: int = None) -> None:
     """Synchronous DB write — called via run_in_executor."""
     try:
         # Sanitize JSON: remove null bytes (PostgreSQL rejects \x00 in text columns)
@@ -4907,9 +5229,14 @@ def _save_audit(audit_id: str, request, report: dict, elapsed: float, user_id: s
             results_json=results_str,
             api_cost=report.get("summary", {}).get("estimated_api_cost", 0.0),
             execution_time=elapsed,
+            profile_id=profile_id,
+            version=version,
+            business_name=request.business_name,
+            business_type=request.business_type,
+            pages_crawled=len(report.get("pages_crawled", [])) or None,
         ))
         db.commit()
-        logger.info(f"[{audit_id}] Saved to database (user={user_id})")
+        logger.info(f"[{audit_id}] Saved to database (user={user_id}, profile={profile_id}, v={version})")
     except Exception as e:
         logger.error(f"[{audit_id}] DB save failed: {type(e).__name__}: {e}", exc_info=True)
     finally:
@@ -4971,6 +5298,11 @@ def list_audits(limit: int = 20, offset: int = 0, current_user: CurrentUser = De
                 "api_cost": r.api_cost,
                 "execution_time": r.execution_time,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
+                "profile_id": r.profile_id,
+                "version": r.version,
+                "business_name": r.business_name,
+                "business_type": r.business_type,
+                "pages_crawled": r.pages_crawled,
             }
             for r in rows
         ]
