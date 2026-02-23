@@ -6472,10 +6472,12 @@ async def manual_keyword_research(
         f"- related_keywords (array of 8-10 strings): closely related keywords\n"
         f"- serp_analysis (string): what type of content currently ranks for this keyword\n"
         f"- recommendation (string): how a {business_type} should target this keyword\n"
-        f"- content_type (string): one of blog, service page, landing page"
+        f"- content_type (string): one of blog, service page, landing page\n"
+        f"- competitor_snippets (array of 3 objects): top 3 likely competitors that rank for this keyword, "
+        f"each with {{ title (string), url (string), snippet (string: what their page does well) }}"
     )
 
-    result = await call_claude(MANUAL_KW_RESEARCH_SYSTEM, prompt, max_tokens=2000)
+    result = await call_claude(MANUAL_KW_RESEARCH_SYSTEM, prompt, max_tokens=2500)
 
     if isinstance(result, dict):
         # Ensure the keyword field is set
