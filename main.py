@@ -5965,6 +5965,214 @@ async def generate_review_response(
     return result if isinstance(result, dict) else {"response": str(result)}
 
 
+# =============================================================================
+# Blog, Social & Guest Post Generators (Prompt 7)
+# =============================================================================
+
+BLOG_GENERATE_SYSTEM = """You are an expert SEO blog writer for local businesses.
+Write comprehensive, SEO-optimized blog articles with proper heading structure.
+Include the target keyword at 1-2% density, local references, and internal linking suggestions.
+End every article with a 5-question FAQ section.
+You ALWAYS respond with valid JSON only — no markdown fences, no extra text.
+Return format: {"content": "full article with [H2: ...] and [H3: ...] heading markers", "meta_title": "under 60 chars", "meta_description": "155 chars with keyword", "word_count": 1800, "faq": [{"question": "...", "answer": "..."}], "internal_links": [{"anchor": "...", "target": "..."}]}"""
+
+SOCIAL_GENERATE_SYSTEM = """You are a social media content strategist for local businesses.
+Generate platform-specific content that is engaging, locally relevant, and SEO-friendly.
+Adapt tone, length, and format to each platform's best practices.
+You ALWAYS respond with valid JSON only — no markdown fences, no extra text."""
+
+GUEST_POST_SYSTEM = """You are an expert content writer specialising in guest posts for link building.
+Write articles adapted to each platform's style and audience.
+Naturally include a backlink to the client's website within the article body.
+Include an author bio section with a link back to the business website.
+You ALWAYS respond with valid JSON only — no markdown fences, no extra text.
+Return format: {"content": "full article text", "title": "article title", "meta_description": "...", "word_count": 1000, "author_bio": "bio with backlink", "backlink_placement": "where the backlink appears"}"""
+
+
+@app.post("/api/generate-blog")
+async def generate_blog(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Generate a full SEO blog article."""
+    topic = (body.get("topic") or "").strip()
+    kw = (body.get("keyword") or "").strip()
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+    word_target = body.get("word_target", 1500)
+
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    prompt = (
+        f"Write a comprehensive blog article about: \"{topic}\"\n\n"
+        f"Business: {business_name or 'Local Business'} ({business_type})\n"
+        f"Location: {location}\n"
+        f"Target keyword: \"{kw}\"\n"
+        f"Target word count: {word_target}\n\n"
+        f"Requirements:\n"
+        f"- Use [H2: ...] and [H3: ...] markers for headings\n"
+        f"- Include local references to {location} throughout\n"
+        f"- Add a 5-question FAQ at the end\n"
+        f"- Suggest 3-5 internal links\n"
+        f"- Write for conversion with CTAs\n"
+        f"- Maintain 1-2% keyword density for \"{kw}\""
+    )
+
+    result = await call_claude(BLOG_GENERATE_SYSTEM, prompt, max_tokens=4000)
+    if isinstance(result, dict):
+        result.setdefault("topic", topic)
+        return result
+    return {"content": str(result), "topic": topic, "word_count": 0}
+
+
+@app.post("/api/generate-social-post")
+async def generate_social_post(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Generate a social media post for a specific platform."""
+    topic = (body.get("topic") or "").strip()
+    platform = (body.get("platform") or "instagram").strip().lower()
+    kw = (body.get("keyword") or "").strip()
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    platform_instructions = {
+        "instagram": (
+            "Write an Instagram caption (150-300 words). Include a hook in the first line, "
+            "use line breaks for readability, add a CTA, and include exactly 30 relevant hashtags "
+            "at the end. Also suggest a carousel/post idea."
+        ),
+        "facebook": (
+            "Write a Facebook post (200-400 words). Make it conversational and shareable. "
+            "Include a question to drive engagement, a CTA, and link preview text."
+        ),
+        "linkedin": (
+            "Write a LinkedIn post (200-350 words). Use a professional but approachable tone. "
+            "Start with a hook, include industry insights, add relevant hashtags (5-10), "
+            "and end with a thought-provoking question."
+        ),
+        "twitter": (
+            "Write a Twitter/X post (max 280 characters). Make it punchy and attention-grabbing. "
+            "Also write a 5-tweet thread version expanding on the topic with hashtags."
+        ),
+    }
+
+    instructions = platform_instructions.get(platform, platform_instructions["instagram"])
+
+    prompt = (
+        f"Create a {platform.title()} post about: \"{topic}\"\n\n"
+        f"Business: {business_name or 'Local Business'} ({business_type})\n"
+        f"Location: {location}\n"
+        f"Primary keyword: \"{kw}\"\n\n"
+        f"Platform instructions: {instructions}\n\n"
+        f"Return JSON: {{\n"
+        f'  "content": "the post content",\n'
+        f'  "hashtags": ["#hashtag1", "#hashtag2"],\n'
+        f'  "platform": "{platform}",\n'
+        f'  "post_idea": "visual/content idea for the post",\n'
+        f'  "best_time": "recommended posting time",\n'
+        f'  "cta": "call to action text"\n'
+        f"}}"
+    )
+
+    result = await call_claude(SOCIAL_GENERATE_SYSTEM, prompt, max_tokens=2000)
+    if isinstance(result, dict):
+        result.setdefault("platform", platform)
+        return result
+    return {"content": str(result), "platform": platform}
+
+
+@app.post("/api/generate-social-all")
+async def generate_social_all(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Generate social media posts for all 4 platforms from one topic."""
+    topic = (body.get("topic") or "").strip()
+    kw = (body.get("keyword") or "").strip()
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    prompt = (
+        f"Create social media content about \"{topic}\" for ALL 4 platforms.\n\n"
+        f"Business: {business_name or 'Local Business'} ({business_type})\n"
+        f"Location: {location}\n"
+        f"Primary keyword: \"{kw}\"\n\n"
+        f"Return JSON:\n"
+        f'{{\n'
+        f'  "instagram": {{"content": "caption 150-300 words + hook + CTA", "hashtags": ["30 hashtags"], "post_idea": "carousel/visual idea"}},\n'
+        f'  "facebook": {{"content": "200-400 words, conversational, shareable", "hashtags": ["5-10"], "post_idea": "engagement idea"}},\n'
+        f'  "linkedin": {{"content": "200-350 words, professional tone, industry insights", "hashtags": ["5-10"], "post_idea": "thought leadership angle"}},\n'
+        f'  "twitter": {{"content": "280 chars max, punchy", "thread": ["tweet 1", "tweet 2", "tweet 3", "tweet 4", "tweet 5"], "hashtags": ["3-5"]}}\n'
+        f'}}'
+    )
+
+    result = await call_claude(SOCIAL_GENERATE_SYSTEM, prompt, max_tokens=3000)
+    if isinstance(result, dict):
+        return result
+    return {"error": "Could not generate content"}
+
+
+@app.post("/api/generate-guest-post")
+async def generate_guest_post(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Generate a guest post adapted for a specific platform."""
+    topic = (body.get("topic") or "").strip()
+    platform = (body.get("platform") or "medium").strip().lower()
+    kw = (body.get("keyword") or "").strip()
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+    target_url = (body.get("target_url") or "").strip()
+
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    platform_styles = {
+        "medium": "Medium style — thoughtful, story-driven, uses subheadings and pull quotes. 800-1200 words.",
+        "linkedin": "LinkedIn Articles — professional, data-driven, industry-focused. 600-1000 words.",
+        "blogger": "Blogger — approachable, how-to focused, practical tips. 800-1200 words.",
+        "tumblr": "Tumblr — casual, personality-driven, shorter paragraphs. 600-800 words.",
+        "industry": "Industry publication — authoritative, well-researched, expert tone. 1000-1500 words.",
+    }
+
+    style = platform_styles.get(platform, platform_styles["medium"])
+
+    prompt = (
+        f"Write a guest post for {platform.title()} about: \"{topic}\"\n\n"
+        f"Business: {business_name or 'Local Business'} ({business_type})\n"
+        f"Location: {location}\n"
+        f"Website to link back to: {target_url or 'the business website'}\n"
+        f"Target keyword: \"{kw}\"\n\n"
+        f"Platform style: {style}\n\n"
+        f"Requirements:\n"
+        f"- Naturally include a backlink to {target_url or 'the business website'}\n"
+        f"- Write an author bio (2-3 sentences) with a link back\n"
+        f"- Match the platform's typical content style\n"
+        f"- Focus on providing genuine value to readers\n"
+        f"- Include \"{kw}\" naturally 2-3 times"
+    )
+
+    result = await call_claude(GUEST_POST_SYSTEM, prompt, max_tokens=3000)
+    if isinstance(result, dict):
+        result.setdefault("platform", platform)
+        return result
+    return {"content": str(result), "platform": platform, "word_count": 0}
+
+
 @app.post("/api/generate-content")
 async def generate_content(
     request: ContentGenerateRequest,
