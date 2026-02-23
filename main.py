@@ -6054,6 +6054,25 @@ class ContentGenerateRequest(BaseModel):
     context: Optional[str] = None  # extra context (area name, question, topic, etc.)
 
 
+class SeoContentRequest(BaseModel):
+    content_type: str = "homepage"  # homepage, service, area, custom
+    target_keyword: str = ""
+    secondary_keywords: list[str] = []
+    service_name: Optional[str] = None   # for service pages
+    target_city: Optional[str] = None    # for area pages
+    business_name: str = ""
+    business_type: str = "local business"
+    location: str = "Toronto, Canada"
+    target_url: str = ""
+    services: Optional[str] = None
+
+
+class SeoScoreRequest(BaseModel):
+    content: str
+    keyword: str
+    city: str
+
+
 @app.post("/api/generate-calendar")
 async def generate_calendar(
     request: CalendarRequest,
@@ -6804,6 +6823,111 @@ async def info():
             "health": "GET /health",
         },
     }
+
+
+# =============================================================================
+# SEO Content Engine endpoints
+# =============================================================================
+
+from seo_engine import (
+    analyze_competitors as _seo_analyze_competitors,
+    generate_seo_content as _seo_generate_content,
+    generate_homepage_content as _seo_homepage,
+    generate_service_page as _seo_service_page,
+    generate_area_page as _seo_area_page,
+    score_existing_content as _seo_score_existing,
+)
+
+
+@app.post("/api/content/generate")
+async def seo_content_generate(
+    request: SeoContentRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Generate SEO-optimized content using the 15-rule engine + score card."""
+    # Parse city/country from location
+    parts = [p.strip() for p in request.location.split(",")]
+    city = parts[0] if parts else "Toronto"
+    country = parts[1] if len(parts) > 1 else "Canada"
+
+    keyword = request.target_keyword or f"{request.business_type} {city}".lower()
+    services = request.services or request.business_type
+
+    # Step 1: Competitor analysis
+    competitor_data = await _seo_analyze_competitors(
+        keyword=keyword,
+        city=city,
+        country=country,
+        claude_caller=call_claude,
+        fetch_competitors_fn=fetch_competitors,
+        scrape_page_fn=scrape_page,
+        business_type=request.business_type,
+    )
+
+    # Step 2: Generate based on content type
+    if request.content_type == "service" and request.service_name:
+        result = await _seo_service_page(
+            business_name=request.business_name,
+            business_type=request.business_type,
+            city=city,
+            country=country,
+            services=services,
+            service_name=request.service_name,
+            competitor_data=competitor_data,
+            claude_caller=call_claude,
+        )
+    elif request.content_type == "area" and request.target_city:
+        result = await _seo_area_page(
+            business_name=request.business_name,
+            business_type=request.business_type,
+            city=city,
+            country=country,
+            services=services,
+            target_city=request.target_city,
+            service_name=request.service_name or request.business_type,
+            competitor_data=competitor_data,
+            claude_caller=call_claude,
+        )
+    elif request.content_type == "homepage":
+        result = await _seo_homepage(
+            business_name=request.business_name,
+            business_type=request.business_type,
+            city=city,
+            country=country,
+            services=services,
+            target_url=request.target_url,
+            competitor_data=competitor_data,
+            claude_caller=call_claude,
+        )
+    else:
+        # Custom / generic
+        result = await _seo_generate_content(
+            business_name=request.business_name,
+            business_type=request.business_type,
+            city=city,
+            country=country,
+            services=services,
+            target_keyword=keyword,
+            secondary_keywords=request.secondary_keywords,
+            page_type=request.content_type,
+            competitor_data=competitor_data,
+            claude_caller=call_claude,
+        )
+
+    return result
+
+
+@app.post("/api/content/score")
+async def seo_content_score(
+    request: SeoScoreRequest,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Score existing content against the 15 SEO rules without generating new content."""
+    return _seo_score_existing(
+        content_html=request.content,
+        keyword=request.keyword,
+        city=request.city,
+    )
 
 
 # =============================================================================
