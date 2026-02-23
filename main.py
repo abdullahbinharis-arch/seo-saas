@@ -4195,7 +4195,7 @@ def _volume_to_int(vol) -> int:
         return 200
 
 
-def build_keyword_data(agents: dict, auto_detected: dict | None) -> dict:
+def build_keyword_data(agents: dict, auto_detected: dict | None, profile_services: list[str] | None = None) -> dict:
     """Build keyword_data section from keyword_research agent."""
     kw = agents.get("keyword_research", {})
     recs = _resolve_agent_recs(kw)
@@ -4270,10 +4270,44 @@ def build_keyword_data(agents: dict, auto_detected: dict | None) -> dict:
             "opportunity": action,
         })
 
+    # --- Build keyword_groups by service ---
+    keyword_groups = []
+    if profile_services:
+        city = ""
+        # Try to extract city from primary keyword or auto_detected
+        if auto_detected and isinstance(auto_detected, dict):
+            city = auto_detected.get("city", "")
+        assigned = set()
+        for service in profile_services:
+            service_lower = service.lower().strip()
+            if not service_lower:
+                continue
+            group_primary = f"{service} {city}".strip() if city else service
+            group_keywords = []
+            for kw in keywords:
+                kw_text = kw.get("keyword", "").lower()
+                if service_lower in kw_text and kw_text not in assigned:
+                    group_keywords.append(kw)
+                    assigned.add(kw_text)
+            keyword_groups.append({
+                "service": service,
+                "primary": group_primary,
+                "keywords": group_keywords,
+            })
+        # Collect unmatched keywords into a "General" group
+        general_kws = [kw for kw in keywords if kw.get("keyword", "").lower() not in assigned]
+        if general_kws:
+            keyword_groups.append({
+                "service": "General",
+                "primary": primary,
+                "keywords": general_kws,
+            })
+
     return {
         "primary_keyword": primary,
         "keywords": keywords[:20],
         "keyword_gaps": keyword_gaps[:15],
+        "keyword_groups": keyword_groups,
     }
 
 
@@ -4614,12 +4648,11 @@ def build_service_keywords(
 
     # Extract all keywords from keyword_data for matching
     all_kw_items = []
-    for group in keyword_data.get("keyword_groups", []):
-        for kw in group.get("keywords", []):
-            if isinstance(kw, dict):
-                all_kw_items.append(kw.get("keyword", "").lower())
-            elif isinstance(kw, str):
-                all_kw_items.append(kw.lower())
+    for kw in keyword_data.get("keywords", []):
+        if isinstance(kw, dict):
+            all_kw_items.append(kw.get("keyword", "").lower())
+        elif isinstance(kw, str):
+            all_kw_items.append(kw.lower())
 
     result: dict = {}
     for service in profile_services:
@@ -5546,7 +5579,7 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
             "target_url": request.target_url,
         }
         gmb_data = build_gmb_data(agents_dict)
-        keyword_data = build_keyword_data(agents_dict, auto_detected)
+        keyword_data = build_keyword_data(agents_dict, auto_detected, profile_services)
         backlink_data = build_backlink_data(agents_dict)
         content_data = build_content_data(agents_dict)
         post_calendar = build_post_calendar(request_data, keyword_data)
@@ -5949,6 +5982,47 @@ async def generate_content(
     prompt += "Write comprehensive, SEO-optimized content."
     result = await call_claude(CONTENT_GENERATE_SYSTEM, prompt, max_tokens=3000)
     return result if isinstance(result, dict) else {"content": str(result)}
+
+
+MANUAL_KW_RESEARCH_SYSTEM = (
+    "You are a local SEO keyword analyst. You analyse keywords for local businesses "
+    "and return actionable data. Respond with valid JSON only — no markdown fences, "
+    "no extra text."
+)
+
+
+@app.post("/api/keyword-research")
+async def manual_keyword_research(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    keyword = body.get("keyword", "").strip()
+    location = body.get("location", "").strip()
+    business_type = body.get("business_type", "local business").strip()
+
+    if not keyword:
+        raise HTTPException(status_code=400, detail="keyword is required")
+
+    prompt = (
+        f"Analyse this keyword for a {business_type} in {location}: \"{keyword}\".\n\n"
+        f"Return a JSON object with these exact keys:\n"
+        f"- keyword (string): the keyword analysed\n"
+        f"- volume_estimate (integer): estimated monthly search volume\n"
+        f"- difficulty_estimate (integer 0-100): SEO difficulty score\n"
+        f"- intent (string): one of commercial, informational, navigational, transactional\n"
+        f"- related_keywords (array of 8-10 strings): closely related keywords\n"
+        f"- serp_analysis (string): what type of content currently ranks for this keyword\n"
+        f"- recommendation (string): how a {business_type} should target this keyword\n"
+        f"- content_type (string): one of blog, service page, landing page"
+    )
+
+    result = await call_claude(MANUAL_KW_RESEARCH_SYSTEM, prompt, max_tokens=2000)
+
+    if isinstance(result, dict):
+        # Ensure the keyword field is set
+        result.setdefault("keyword", keyword)
+        return result
+    return {"keyword": keyword, "error": "Could not parse result"}
 
 
 # =============================================================================
