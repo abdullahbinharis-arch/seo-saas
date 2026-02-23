@@ -458,13 +458,25 @@ def list_profiles(current_user: CurrentUser = Depends(get_current_user)):
                 .order_by(Audit.created_at.desc())
                 .first()
             )
-            d["latest_audit"] = {
-                "id": latest.id,
-                "version": latest.version,
-                "keyword": latest.keyword,
-                "status": latest.status,
-                "created_at": latest.created_at.isoformat() if latest.created_at else None,
-            } if latest else None
+            if latest:
+                latest_score = None
+                try:
+                    ldata = json.loads(latest.results_json) if latest.results_json else {}
+                    lscores = ldata.get("scores")
+                    if lscores and isinstance(lscores, dict):
+                        latest_score = lscores.get("overall")
+                except Exception:
+                    pass
+                d["latest_audit"] = {
+                    "id": latest.id,
+                    "version": latest.version,
+                    "keyword": latest.keyword,
+                    "status": latest.status,
+                    "overall_score": latest_score,
+                    "created_at": latest.created_at.isoformat() if latest.created_at else None,
+                }
+            else:
+                d["latest_audit"] = None
             result.append(d)
         return result
     finally:
@@ -491,13 +503,25 @@ def get_profile(profile_id: str, current_user: CurrentUser = Depends(get_current
             .order_by(Audit.created_at.desc())
             .first()
         )
-        d["latest_audit"] = {
-            "id": latest.id,
-            "version": latest.version,
-            "keyword": latest.keyword,
-            "status": latest.status,
-            "created_at": latest.created_at.isoformat() if latest.created_at else None,
-        } if latest else None
+        if latest:
+            latest_score = None
+            try:
+                ldata = json.loads(latest.results_json) if latest.results_json else {}
+                lscores = ldata.get("scores")
+                if lscores and isinstance(lscores, dict):
+                    latest_score = lscores.get("overall")
+            except Exception:
+                pass
+            d["latest_audit"] = {
+                "id": latest.id,
+                "version": latest.version,
+                "keyword": latest.keyword,
+                "status": latest.status,
+                "overall_score": latest_score,
+                "created_at": latest.created_at.isoformat() if latest.created_at else None,
+            }
+        else:
+            d["latest_audit"] = None
         return d
     finally:
         db.close()
@@ -573,8 +597,17 @@ def list_profile_audits(profile_id: str, current_user: CurrentUser = Depends(get
             .order_by(Audit.version.desc())
             .all()
         )
-        return [
-            {
+        result = []
+        for r in rows:
+            overall_score = None
+            try:
+                data = json.loads(r.results_json) if r.results_json else {}
+                scores = data.get("scores")
+                if scores and isinstance(scores, dict):
+                    overall_score = scores.get("overall")
+            except Exception:
+                pass
+            result.append({
                 "id": r.id,
                 "version": r.version,
                 "keyword": r.keyword,
@@ -586,10 +619,10 @@ def list_profile_audits(profile_id: str, current_user: CurrentUser = Depends(get
                 "pages_crawled": r.pages_crawled,
                 "api_cost": r.api_cost,
                 "execution_time": r.execution_time,
+                "overall_score": overall_score,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in rows
-        ]
+            })
+        return result
     finally:
         db.close()
 
@@ -636,6 +669,93 @@ def get_profile_audit(profile_id: str, audit_id: str, current_user: CurrentUser 
         if not row:
             raise HTTPException(status_code=404, detail="Audit not found")
         return json.loads(row.results_json)
+    finally:
+        db.close()
+
+
+@app.get("/profiles/{profile_id}/compare")
+def compare_audit_versions(
+    profile_id: str,
+    v1: str,
+    v2: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Compare two audit versions for a profile. Returns score diffs, issues, keywords."""
+    db = SessionLocal()
+    try:
+        p = db.query(Profile).filter(
+            Profile.id == profile_id,
+            Profile.user_id == current_user.id,
+        ).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+        a1 = db.query(Audit).filter(Audit.id == v1, Audit.profile_id == profile_id).first()
+        a2 = db.query(Audit).filter(Audit.id == v2, Audit.profile_id == profile_id).first()
+        if not a1 or not a2:
+            raise HTTPException(status_code=404, detail="One or both audit versions not found")
+
+        d1 = json.loads(a1.results_json) if a1.results_json else {}
+        d2 = json.loads(a2.results_json) if a2.results_json else {}
+
+        def _scores(d):
+            s = d.get("scores", {})
+            return {
+                "overall": s.get("overall", 0),
+                "website_seo": s.get("website_seo", 0),
+                "backlinks": s.get("backlinks", 0),
+                "local_seo": s.get("local_seo", 0),
+                "ai_seo": s.get("ai_seo", 0),
+            }
+
+        def _issues(d):
+            agents = d.get("agents", {})
+            on_page = agents.get("on_page_seo", {})
+            recs = on_page.get("recommendations", {})
+            current = recs.get("current_analysis", {})
+            return current.get("issues_found", [])
+
+        def _keywords(d):
+            kd = d.get("keyword_data", {})
+            items = kd.get("keywords", [])
+            return [k.get("keyword", "") for k in items if isinstance(k, dict)]
+
+        s1 = _scores(d1)
+        s2 = _scores(d2)
+
+        score_changes = {}
+        for key in s1:
+            score_changes[key] = {
+                "v1": s1[key],
+                "v2": s2[key],
+                "change": s2[key] - s1[key],
+            }
+
+        issues_v1 = set(_issues(d1))
+        issues_v2 = set(_issues(d2))
+        kw_v1 = set(_keywords(d1))
+        kw_v2 = set(_keywords(d2))
+
+        return {
+            "profile_id": profile_id,
+            "v1": {
+                "id": a1.id,
+                "version": a1.version,
+                "created_at": a1.created_at.isoformat() if a1.created_at else None,
+            },
+            "v2": {
+                "id": a2.id,
+                "version": a2.version,
+                "created_at": a2.created_at.isoformat() if a2.created_at else None,
+            },
+            "score_changes": score_changes,
+            "issues_fixed": list(issues_v1 - issues_v2),
+            "new_issues": list(issues_v2 - issues_v1),
+            "unchanged_issues": list(issues_v1 & issues_v2),
+            "new_keywords": list(kw_v2 - kw_v1),
+            "lost_keywords": list(kw_v1 - kw_v2),
+            "common_keywords": list(kw_v1 & kw_v2),
+        }
     finally:
         db.close()
 
