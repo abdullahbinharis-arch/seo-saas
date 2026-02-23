@@ -2833,8 +2833,20 @@ Return JSON with EXACTLY these keys:
     "<fast backlink win 1 — e.g. claim BBB listing>",
     "<fast win 2>",
     "<fast win 3>"
+  ],
+  "current_backlinks": [
+    {{
+      "source": "<likely directory or citation listing e.g. Yelp, Google Business, Facebook>",
+      "da": <estimated DA of that source>,
+      "type": "follow|nofollow",
+      "anchor": "<likely anchor text>",
+      "first_seen": "<estimated date YYYY-MM or 'Unknown'>",
+      "status": "active|likely-active|unverified"
+    }}
   ]
-}}"""
+}}
+
+For current_backlinks: estimate 5-10 likely backlinks this business type would have based on scraped signals, common directory listings (Google Business Profile, Yelp, Facebook, BBB, industry directories), and any links visible on the page. Use realistic DA values for known directories."""
 
 
 @app.post("/agents/backlink-analysis")
@@ -2972,7 +2984,7 @@ Return JSON with EXACTLY this structure (no outreach_template fields yet — tho
 }}
 
 Rules:
-- quick_wins: 4 real directories a {business_type} should be on (Google Business Profile, Yelp, BBB, industry-specific)
+- quick_wins: 4 real directories a {business_type} should be on (Google Business Profile, Yelp, BBB, industry-specific). Include at least 2 niche directories specific to the business_type (e.g. Healthgrades for dentists, Avvo for lawyers, HomeStars for contractors, TripAdvisor for restaurants, Houzz for interior designers, FindLaw for attorneys, Zocdoc for doctors)
 - guest_posting: 3 real publications covering {business_type} topics or {location} local news
 - resource_pages: 3 pages (local government, community resource lists, industry associations)
 - local_opportunities: 4 (chamber of commerce, local newspaper, sponsor, neighbourhood group in {location})
@@ -4469,39 +4481,47 @@ def build_backlink_data(agents: dict) -> dict:
             comp_das.append(int(comp.get("da", 0)))
     competitor_avg_da = int(sum(comp_das) / len(comp_das)) if comp_das else da_obj.get("vs_competitors_avg", 0) or 0
 
-    # Current backlinks (limited data — build from quick_wins and competitor info)
+    # Current backlinks from Claude's analysis (estimated directory/citation listings)
     current_backlinks = []
-    for win in bl_rec.get("quick_wins", [])[:5]:
-        if isinstance(win, str) and win:
+    for bl_item in bl_rec.get("current_backlinks", []):
+        if isinstance(bl_item, dict):
             current_backlinks.append({
-                "source": win[:60],
-                "da": 0,
-                "type": "follow",
-                "anchor": "",
+                "source": bl_item.get("source", ""),
+                "da": int(bl_item.get("da", 0)),
+                "type": bl_item.get("type", "follow"),
+                "anchor": bl_item.get("anchor", ""),
+                "first_seen": bl_item.get("first_seen", "Unknown"),
+                "status": bl_item.get("status", "unverified"),
             })
 
-    # Opportunities from link_building agent
+    # Opportunities from link_building agent — field names match frontend BacklinkOpportunity type
     opportunities = []
     for cat in ("quick_wins", "guest_posting", "resource_pages", "local_opportunities"):
         for opp in (lb_rec.get(cat) or []):
             if isinstance(opp, dict):
-                opportunities.append({
-                    "target": opp.get("name", ""),
-                    "da": int(opp.get("expected_da", 0)),
+                entry = {
+                    "name": opp.get("name", ""),
+                    "expected_da": int(opp.get("expected_da", 0)),
                     "type": (opp.get("link_type") or cat.replace("_", " ")).capitalize(),
-                    "effort": (opp.get("difficulty") or "Medium").capitalize(),
+                    "difficulty": (opp.get("difficulty") or "Medium").capitalize(),
                     "url": opp.get("url", ""),
-                })
+                }
+                if opp.get("outreach_template"):
+                    entry["outreach_template"] = opp["outreach_template"]
+                opportunities.append(entry)
     # Also add competitor gaps
     for opp in (lb_rec.get("competitor_gaps") or []):
         if isinstance(opp, dict):
-            opportunities.append({
-                "target": opp.get("name", ""),
-                "da": int(opp.get("expected_da", 0)),
+            entry = {
+                "name": opp.get("name", ""),
+                "expected_da": int(opp.get("expected_da", 0)),
                 "type": "Competitor Gap",
-                "effort": "Medium",
+                "difficulty": "Medium",
                 "url": opp.get("url", ""),
-            })
+            }
+            if opp.get("outreach_template"):
+                entry["outreach_template"] = opp["outreach_template"]
+            opportunities.append(entry)
 
     return {
         "domain_authority": int(da_obj.get("score", 0)),
