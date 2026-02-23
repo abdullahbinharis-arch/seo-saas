@@ -170,6 +170,7 @@ class AuditRequest(BaseModel):
     location: str = "Toronto, Canada"
     business_name: Optional[str] = None
     business_type: Optional[str] = None
+    services: Optional[list[str]] = None
     user_id: Optional[str] = None
     profile_id: Optional[str] = None
     include_blog: bool = False  # opt-in: adds ~40s but generates a full blog post
