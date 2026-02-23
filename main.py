@@ -53,6 +53,7 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "LocalRankr <reports@localrankr.io>")
 MOZ_ACCESS_ID = os.getenv("MOZ_ACCESS_ID", "")
 MOZ_SECRET_KEY = os.getenv("MOZ_SECRET_KEY", "")
+MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "50"))
 
 if not ANTHROPIC_API_KEY:
     logger.warning("⚠️  ANTHROPIC_API_KEY is not set — Claude calls will fail")
@@ -858,8 +859,14 @@ def _normalize_url(url: str) -> str:
     return urlunparse((p.scheme, p.netloc.lower(), path, "", "", ""))
 
 
-async def crawl_site(start_url: str, max_pages: int = 20) -> list[dict]:
-    """BFS crawl from start_url following internal links up to max_pages.
+async def crawl_site(start_url: str, max_pages: int = 50) -> list[dict]:
+    """Crawl a site using sitemap URLs first, then BFS fallback for discovery.
+
+    Strategy:
+    1. Fetch sitemap.xml and extract URLs (same domain, HTML only)
+    2. Seed the crawl queue with sitemap URLs
+    3. If no sitemap or empty, fall back to BFS from start_url
+    4. Always include the start_url (homepage) first
 
     Fetches pages in batches of 5 concurrently.
     Returns list of scrape_page() dicts where success=True.
@@ -873,6 +880,23 @@ async def crawl_site(start_url: str, max_pages: int = 20) -> list[dict]:
     visited: set[str] = set()
     queue: list[str] = [start_url]
     pages: list[dict] = []
+
+    # Try sitemap-first strategy: seed queue with sitemap URLs
+    crawl_strategy = "bfs"
+    try:
+        robots_sitemap = await fetch_robots_and_sitemap(start_url)
+        sitemap_urls = robots_sitemap.get("sitemap_xml", {}).get("urls", [])
+        if sitemap_urls:
+            crawl_strategy = "sitemap"
+            # Add sitemap URLs to queue (after start_url to keep homepage first)
+            for u in sitemap_urls:
+                norm = _normalize_url(u)
+                start_norm = _normalize_url(start_url)
+                if norm != start_norm and norm not in visited:
+                    queue.append(u)
+            logger.info(f"Sitemap seeded queue with {len(sitemap_urls)} URLs for {start_url}")
+    except Exception as e:
+        logger.warning(f"Sitemap fetch failed during crawl, using BFS only: {e}")
 
     while queue and len(pages) < max_pages:
         # Build a batch of up to 5 unvisited URLs
@@ -896,7 +920,7 @@ async def crawl_site(start_url: str, max_pages: int = 20) -> list[dict]:
                 continue
             pages.append(result)
 
-            # Discover new internal links
+            # Discover new internal links (BFS expansion — works for both strategies)
             for link in result.get("internal_links", []):
                 href = link.get("href", "")
                 if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
@@ -916,15 +940,79 @@ async def crawl_site(start_url: str, max_pages: int = 20) -> list[dict]:
                 if norm not in visited:
                     queue.append(full_url)
 
-    logger.info(f"Site crawl complete: {len(pages)} pages from {start_url}")
+    logger.info(f"Site crawl complete: {len(pages)} pages from {start_url} (strategy={crawl_strategy})")
     return pages
+
+
+def detect_page_type(url: str, title: str = "", location: str = "") -> str:
+    """Rule-based classification of a page by its URL path and title.
+
+    Returns a human-readable page type string. No Claude calls.
+    """
+    from urllib.parse import urlparse
+    path = urlparse(url).path.lower().rstrip("/")
+    title_lower = title.lower()
+    combined = f"{path} {title_lower}"
+
+    # Homepage
+    if path in ("", "/"):
+        return "Homepage"
+
+    # Blog / News / Article
+    if any(kw in combined for kw in ("blog", "news", "article", "post", "/category/")):
+        return "Blog Post"
+
+    # About
+    if any(kw in combined for kw in ("about", "our-story", "our-team", "who-we-are")):
+        return "About"
+
+    # Contact
+    if any(kw in combined for kw in ("contact", "get-in-touch", "reach-us")):
+        return "Contact"
+
+    # FAQ
+    if "faq" in combined or "frequently-asked" in combined:
+        return "FAQ"
+
+    # Pricing
+    if "pricing" in combined or "price" in combined or "rates" in combined:
+        return "Pricing"
+
+    # Portfolio / Gallery
+    if any(kw in combined for kw in ("portfolio", "gallery", "projects", "our-work", "case-stud")):
+        return "Portfolio"
+
+    # Testimonials / Reviews
+    if any(kw in combined for kw in ("testimonial", "review", "feedback", "client-stories")):
+        return "Testimonials"
+
+    # Service area — check if location city name appears in path
+    if location:
+        city = location.split(",")[0].strip().lower()
+        city_slug = city.replace(" ", "-")
+        if city_slug in path or city in path:
+            return "Service Area"
+
+    # Services (check after more specific types)
+    if any(kw in combined for kw in ("service", "what-we-do", "solutions", "offerings")):
+        return "Services"
+
+    # Careers
+    if any(kw in combined for kw in ("career", "jobs", "hiring", "join-us")):
+        return "Careers"
+
+    # Privacy / Legal
+    if any(kw in combined for kw in ("privacy", "terms", "legal", "policy", "disclaimer")):
+        return "Legal"
+
+    return "Page"
 
 
 def aggregate_crawl_results(pages: list[dict]) -> dict:
     """Compute site-wide on-page aggregate stats from crawled pages."""
     total = len(pages)
     if not total:
-        return {"pages_crawled": 0}
+        return {"pages_crawled": 0, "page_types": {}}
 
     missing_title = sum(1 for p in pages if not p.get("title"))
     missing_meta = sum(1 for p in pages if not p.get("meta_description"))
@@ -935,6 +1023,12 @@ def aggregate_crawl_results(pages: list[dict]) -> dict:
         100 - ((missing_title + missing_meta + missing_h1) / (total * 3)) * 100
     )
 
+    # Page type breakdown
+    page_types: dict[str, int] = {}
+    for p in pages:
+        pt = p.get("page_type", "Page")
+        page_types[pt] = page_types.get(pt, 0) + 1
+
     return {
         "pages_crawled": total,
         "missing_title": missing_title,
@@ -944,6 +1038,7 @@ def aggregate_crawl_results(pages: list[dict]) -> dict:
         "thin_content_count": len(thin_pages),
         "thin_content_pages": thin_pages[:10],
         "coverage_score": max(0, coverage_score),
+        "page_types": page_types,
     }
 
 
@@ -1158,19 +1253,44 @@ async def check_redirect_chain(url: str) -> dict:
 
 
 async def fetch_robots_and_sitemap(base_url: str) -> dict:
-    """Fetch /robots.txt and /sitemap.xml, report existence and key details."""
+    """Fetch /robots.txt and /sitemap.xml, report existence and key details.
+
+    Parses actual URLs from sitemap XML, filtering to same domain and HTML pages.
+    Handles sitemap index files by fetching the first child sitemap.
+    """
     from urllib.parse import urlparse
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
+    base_netloc = parsed.netloc.lower()
+
+    NON_HTML_EXTS = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".zip", ".xml", ".gz",
+                     ".mp4", ".mp3", ".avi", ".doc", ".docx", ".xls", ".xlsx", ".css", ".js")
+
+    def _parse_sitemap_urls(xml_text: str) -> list[str]:
+        """Extract <loc> URLs from sitemap XML, filter to same domain + HTML only."""
+        raw_urls = re.findall(r"<loc>\s*(.*?)\s*</loc>", xml_text, re.IGNORECASE)
+        urls = []
+        for u in raw_urls:
+            u = u.strip()
+            try:
+                p = urlparse(u)
+            except Exception:
+                continue
+            if p.netloc.lower() != base_netloc:
+                continue
+            if any(p.path.lower().endswith(ext) for ext in NON_HTML_EXTS):
+                continue
+            urls.append(u)
+        return urls
 
     result = {
         "robots_txt": {"exists": False, "blocks_important": False, "content_preview": None},
-        "sitemap_xml": {"exists": False, "url_count": 0, "sitemap_url": None},
+        "sitemap_xml": {"exists": False, "url_count": 0, "sitemap_url": None, "urls": []},
     }
 
     try:
         async with httpx.AsyncClient(
-            timeout=8.0,
+            timeout=10.0,
             follow_redirects=True,
             headers={"User-Agent": "SEOSaasBot/1.0"},
         ) as http:
@@ -1180,23 +1300,37 @@ async def fetch_robots_and_sitemap(base_url: str) -> dict:
                 return_exceptions=True,
             )
 
-        # robots.txt
-        if not isinstance(robots_resp, Exception) and robots_resp.status_code == 200:
-            content = robots_resp.text
-            result["robots_txt"]["exists"] = True
-            result["robots_txt"]["content_preview"] = content[:300].replace("\r", "").replace("\t", " ")
-            # Check if it blocks /
-            lines_lower = content.lower()
-            result["robots_txt"]["blocks_important"] = (
-                "disallow: /" in lines_lower and "allow: /" not in lines_lower
-            )
+            # robots.txt
+            if not isinstance(robots_resp, Exception) and robots_resp.status_code == 200:
+                content = robots_resp.text
+                result["robots_txt"]["exists"] = True
+                result["robots_txt"]["content_preview"] = content[:300].replace("\r", "").replace("\t", " ")
+                lines_lower = content.lower()
+                result["robots_txt"]["blocks_important"] = (
+                    "disallow: /" in lines_lower and "allow: /" not in lines_lower
+                )
 
-        # sitemap.xml
-        if not isinstance(sitemap_resp, Exception) and sitemap_resp.status_code == 200:
-            result["sitemap_xml"]["exists"] = True
-            result["sitemap_xml"]["sitemap_url"] = f"{origin}/sitemap.xml"
-            # Count <loc> entries as a rough URL count
-            result["sitemap_xml"]["url_count"] = sitemap_resp.text.count("<loc>")
+            # sitemap.xml
+            if not isinstance(sitemap_resp, Exception) and sitemap_resp.status_code == 200:
+                result["sitemap_xml"]["exists"] = True
+                result["sitemap_xml"]["sitemap_url"] = f"{origin}/sitemap.xml"
+                xml_text = sitemap_resp.text
+
+                # Check if this is a sitemap index (<sitemapindex>)
+                if "<sitemapindex" in xml_text.lower():
+                    child_urls = re.findall(r"<loc>\s*(.*?)\s*</loc>", xml_text, re.IGNORECASE)
+                    if child_urls:
+                        # Fetch the first child sitemap
+                        try:
+                            child_resp = await http.get(child_urls[0].strip())
+                            if child_resp.status_code == 200:
+                                xml_text = child_resp.text
+                        except Exception:
+                            pass  # fall through with original xml_text
+
+                sitemap_urls = _parse_sitemap_urls(xml_text)
+                result["sitemap_xml"]["url_count"] = len(sitemap_urls)
+                result["sitemap_xml"]["urls"] = sitemap_urls
 
     except Exception as e:
         logger.warning(f"Robots/sitemap fetch failed: {e}")
@@ -1792,7 +1926,7 @@ async def on_page_seo_agent(request: AuditRequest, pre_scraped_pages: list[dict]
     extra_pages_section = ""
     if pre_scraped_pages and len(pre_scraped_pages) > 1:
         lines = ["\nOTHER SITE PAGES (crawled — top service pages by word count):"]
-        for p in pre_scraped_pages[1:4]:
+        for p in pre_scraped_pages[1:16]:
             lines.append(
                 f"- {p['url']} | Title: {p.get('title','—')} | H1: {p.get('h1','—')} "
                 f"| Words: {p.get('word_count', 0)}"
@@ -2206,6 +2340,127 @@ Factor these site-wide issues into your priority_actions — e.g. if 8/20 pages 
     except Exception as e:
         logger.error(f"[{audit_id}] Technical SEO agent failed: {type(e).__name__}: {e}", exc_info=True)
         raise
+
+
+# =============================================================================
+# Per-Page SEO Analysis (batched Claude calls)
+# =============================================================================
+
+PAGE_ANALYSIS_SYSTEM = """You are an expert SEO auditor analysing individual web pages for on-page SEO quality.
+You ALWAYS respond with valid JSON only — no markdown, no explanation, no preamble.
+Be specific, actionable, and data-driven in your analysis."""
+
+PAGE_ANALYSIS_PROMPT = """Analyse these {page_count} web pages for on-page SEO quality. For each page, evaluate title tag, meta description, H1 tags, word count, keyword usage, and content structure.
+
+BUSINESS: {business_name} ({business_type}) in {location}
+TARGET KEYWORD: {keyword}
+
+PAGES TO ANALYSE:
+{pages_data}
+
+Respond with a JSON array. For each page return:
+{{
+  "url": "the page URL",
+  "page_type": "detected page type",
+  "page_score": 0-100,
+  "title_analysis": {{
+    "current": "current title",
+    "length": number,
+    "has_keyword": true/false,
+    "has_location": true/false,
+    "rating": "good|needs_improvement|poor"
+  }},
+  "meta_analysis": {{
+    "current": "current meta description",
+    "length": number,
+    "has_keyword": true/false,
+    "has_cta": true/false,
+    "rating": "good|needs_improvement|poor"
+  }},
+  "h1_tags": ["list of H1 tags found"],
+  "word_count": number,
+  "issues": ["list of specific SEO issues found"],
+  "recommended_title": "optimised title suggestion (under 60 chars)",
+  "recommended_meta": "optimised meta description (under 155 chars)",
+  "recommended_keywords": ["3-5 keywords this page should target"],
+  "content_recommendation": "one sentence on how to improve this page's content"
+}}"""
+
+
+async def analyze_pages_batch(
+    pages: list[dict],
+    request,
+    batch_size: int = 4,
+) -> dict:
+    """Run per-page SEO analysis in batched Claude calls.
+
+    Splits pages into batches of `batch_size`, runs all batches concurrently,
+    and returns a dict mapping URL path → page analysis.
+    Individual batch failures are caught and logged, not propagated.
+    """
+    from urllib.parse import urlparse
+
+    if not pages:
+        return {}
+
+    # Build batches
+    batches: list[list[dict]] = []
+    for i in range(0, len(pages), batch_size):
+        batches.append(pages[i:i + batch_size])
+
+    async def _analyze_batch(batch: list[dict]) -> list[dict]:
+        """Analyze a single batch of pages via one Claude call."""
+        pages_data_lines = []
+        for idx, p in enumerate(batch, 1):
+            pages_data_lines.append(
+                f"Page {idx}:\n"
+                f"  URL: {p.get('url', 'N/A')}\n"
+                f"  Title: {p.get('title', 'N/A')}\n"
+                f"  Meta Description: {p.get('meta_description', 'N/A')}\n"
+                f"  H1: {p.get('h1', 'N/A')}\n"
+                f"  Word Count: {p.get('word_count', 0)}\n"
+                f"  Headings: {json.dumps(p.get('headings', [])[:8])}\n"
+                f"  Content Preview: {p.get('content', '')[:400]}"
+            )
+
+        prompt = PAGE_ANALYSIS_PROMPT.format(
+            page_count=len(batch),
+            business_name=request.business_name or "this business",
+            business_type=request.business_type or "local business",
+            location=request.location,
+            keyword=request.keyword,
+            pages_data="\n\n".join(pages_data_lines),
+        )
+
+        result = await call_claude(PAGE_ANALYSIS_SYSTEM, prompt, max_tokens=3000)
+
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "pages" in result:
+            return result["pages"]
+        return []
+
+    # Run all batches concurrently
+    batch_results = await asyncio.gather(
+        *[_analyze_batch(b) for b in batches],
+        return_exceptions=True,
+    )
+
+    # Merge results into a dict keyed by URL path
+    page_analysis: dict = {}
+    for i, result in enumerate(batch_results):
+        if isinstance(result, Exception):
+            logger.warning(f"Page analysis batch {i+1}/{len(batches)} failed: {result}")
+            continue
+        if not isinstance(result, list):
+            continue
+        for entry in result:
+            if isinstance(entry, dict) and entry.get("url"):
+                path = urlparse(entry["url"]).path.rstrip("/") or "/"
+                page_analysis[path] = entry
+
+    logger.info(f"Per-page analysis complete: {len(page_analysis)}/{len(pages)} pages analyzed")
+    return page_analysis
 
 
 # =============================================================================
@@ -4334,6 +4589,110 @@ def calculate_cost_estimate(agents_run: int = 4) -> float:
     return round(input_cost + output_cost, 4)
 
 
+def build_service_keywords(
+    profile_services: list[str],
+    location: str,
+    keyword_data: dict,
+    crawled_pages: list[dict],
+) -> dict:
+    """Build per-service keyword targets + page mapping. No Claude calls.
+
+    Returns dict[service_name → {primary, related, current_page, has_dedicated_page, recommendation}].
+    """
+    from urllib.parse import urlparse
+
+    if not profile_services:
+        return {}
+
+    city = location.split(",")[0].strip() if location else ""
+
+    # Build a lookup: URL path → page dict
+    page_paths: dict[str, dict] = {}
+    for p in crawled_pages:
+        path = urlparse(p.get("url", "")).path.lower().rstrip("/") or "/"
+        page_paths[path] = p
+
+    # Extract all keywords from keyword_data for matching
+    all_kw_items = []
+    for group in keyword_data.get("keyword_groups", []):
+        for kw in group.get("keywords", []):
+            if isinstance(kw, dict):
+                all_kw_items.append(kw.get("keyword", "").lower())
+            elif isinstance(kw, str):
+                all_kw_items.append(kw.lower())
+
+    result: dict = {}
+    for service in profile_services:
+        service_lower = service.lower().strip()
+        if not service_lower:
+            continue
+
+        slug = service_lower.replace(" ", "-")
+        primary = f"{service} {city}".strip() if city else service
+
+        # Find related keywords from keyword_data
+        related = [
+            kw for kw in all_kw_items
+            if service_lower in kw and kw != primary.lower()
+        ][:5]
+
+        # Check if a dedicated page exists for this service
+        current_page = None
+        has_dedicated = False
+        for path, page in page_paths.items():
+            if slug in path or service_lower.replace(" ", "") in path.replace("-", ""):
+                current_page = page.get("url", "")
+                has_dedicated = True
+                break
+
+        if has_dedicated:
+            recommendation = f"Optimise existing page for '{primary}' — ensure keyword in title, H1, and first paragraph."
+        else:
+            recommendation = f"Create a dedicated service page targeting '{primary}' with 800+ words of locally-optimised content."
+
+        result[service] = {
+            "primary": primary,
+            "related": related,
+            "current_page": current_page,
+            "has_dedicated_page": has_dedicated,
+            "recommendation": recommendation,
+        }
+
+    return result
+
+
+def build_schema_recommendations(crawled_pages: list[dict]) -> dict:
+    """Rule-based schema type recommendations per page. No Claude calls.
+
+    Returns dict[url_path → [schema_type, ...]].
+    """
+    from urllib.parse import urlparse
+
+    SCHEMA_MAP = {
+        "Homepage": ["LocalBusiness", "BreadcrumbList", "WebSite"],
+        "Services": ["Service", "BreadcrumbList", "FAQPage"],
+        "About": ["Organization", "BreadcrumbList", "AboutPage"],
+        "Contact": ["LocalBusiness", "BreadcrumbList", "ContactPage"],
+        "Blog Post": ["Article", "BreadcrumbList"],
+        "FAQ": ["FAQPage", "BreadcrumbList"],
+        "Pricing": ["Product", "BreadcrumbList", "AggregateOffer"],
+        "Portfolio": ["CreativeWork", "BreadcrumbList", "ImageGallery"],
+        "Testimonials": ["Review", "BreadcrumbList", "AggregateRating"],
+        "Service Area": ["Service", "BreadcrumbList", "LocalBusiness"],
+        "Careers": ["JobPosting", "BreadcrumbList"],
+        "Legal": ["WebPage", "BreadcrumbList"],
+        "Page": ["WebPage", "BreadcrumbList"],
+    }
+
+    result: dict = {}
+    for p in crawled_pages:
+        path = urlparse(p.get("url", "")).path.rstrip("/") or "/"
+        page_type = p.get("page_type", "Page")
+        result[path] = SCHEMA_MAP.get(page_type, ["WebPage", "BreadcrumbList"])
+
+    return result
+
+
 def _send_audit_email(to_email: str, report: dict) -> None:
     """Send a branded HTML audit summary email via Resend."""
     if not RESEND_API_KEY:
@@ -4953,9 +5312,9 @@ async def _run_audit_background(audit_id: str, request: AuditRequest, current_us
 
 async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> dict:
     """
-    Full SEO Audit — runs keyword research first, then on-page + local + technical concurrently.
-    When 'domain' is provided, crawls up to 20 pages first and passes site-wide data to agents.
-    Total time: ~60-90 seconds (single URL) or ~90-120 seconds (site crawl).
+    Full SEO Audit — always crawls the full site (sitemap-first, BFS fallback),
+    runs keyword research first, then all agents + per-page analysis concurrently.
+    Total time: ~90-120 seconds.
     """
     start = time.time()
     logger.info(f"[{audit_id}] Full audit starting for '{request.keyword}' → {request.target_url}")
@@ -4998,19 +5357,35 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
 
     auto_detected: dict | None = None
     secondary_keywords: list[str] | None = None
+    profile_services: list[str] = []
+
+    # Parse services from profile if available
+    if profile_id and current_user:
+        db = SessionLocal()
+        try:
+            profile = db.query(Profile).filter(Profile.id == profile_id).first()
+            if profile and profile.services:
+                try:
+                    parsed = json.loads(profile.services)
+                    if isinstance(parsed, list):
+                        profile_services = [s for s in parsed if isinstance(s, str) and s.strip()]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        finally:
+            db.close()
 
     try:
-        # Phase 0 — site crawl (only when domain is provided)
-        crawled_pages: list[dict] = []
-        crawl_aggregate: dict = {}
-        if request.domain:
-            logger.info(f"[{audit_id}] Domain mode — crawling {request.target_url}")
-            crawled_pages = await crawl_site(request.target_url, max_pages=20)
-            crawl_aggregate = aggregate_crawl_results(crawled_pages)
-            logger.info(
-                f"[{audit_id}] Crawl done: {crawl_aggregate.get('pages_crawled', 0)} pages, "
-                f"coverage {crawl_aggregate.get('coverage_score', 0)}/100"
-            )
+        # Phase 0 — always crawl the site (sitemap-first, then BFS fallback)
+        logger.info(f"[{audit_id}] Crawling site: {request.target_url}")
+        crawled_pages = await crawl_site(request.target_url, max_pages=MAX_CRAWL_PAGES)
+        # Enrich pages with detected page type
+        for p in crawled_pages:
+            p["page_type"] = detect_page_type(p["url"], p.get("title", ""), request.location)
+        crawl_aggregate = aggregate_crawl_results(crawled_pages)
+        logger.info(
+            f"[{audit_id}] Crawl done: {crawl_aggregate.get('pages_crawled', 0)} pages, "
+            f"coverage {crawl_aggregate.get('coverage_score', 0)}/100"
+        )
 
         # Phase 0.5 — auto-detect keyword (only when keyword is not provided)
         if not request.keyword:
@@ -5022,12 +5397,15 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
             if not request.business_type and auto_detected.get("business_type"):
                 request.business_type = auto_detected["business_type"]
             logger.info(f"[{audit_id}] Auto-detected keyword='{request.keyword}', type='{request.business_type}'")
+            # Enrich profile_services from auto-detected if profile had none
+            if not profile_services and auto_detected.get("services"):
+                profile_services = [s for s in auto_detected["services"] if isinstance(s, str)]
 
         # Phase 1 — keyword research (other agents benefit from this data)
         keyword_results = await keyword_research_agent(request, secondary_keywords=secondary_keywords)
 
         # Phase 2, 3 + 4 — all independent agents run concurrently
-        # For domain mode: on-page gets pre-crawled pages sorted by word count (homepage first),
+        # On-page gets pre-crawled pages sorted by word count (homepage first),
         # technical gets the site-wide aggregate for site-level recommendations.
         sorted_pages = sorted(crawled_pages, key=lambda p: p.get("word_count", 0), reverse=True)
         # Ensure homepage is always first
@@ -5047,6 +5425,7 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
             gbp_audit_agent(request),
             citation_builder_agent(request),
             rank_tracker_agent(request),
+            analyze_pages_batch(crawled_pages, request),
         ]
         if request.include_blog:
             concurrent_tasks.append(blog_writer_agent(request))
@@ -5056,8 +5435,8 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
         # Log any per-agent exceptions so we can diagnose without hiding them
         agent_names = ["on_page_seo", "local_seo", "technical_seo", "content_rewriter",
                        "backlink_analysis", "link_building", "ai_seo", "gbp_audit",
-                       "citation_builder", "rank_tracker"]
-        for name, res in zip(agent_names, results[:10]):
+                       "citation_builder", "rank_tracker", "page_analysis"]
+        for name, res in zip(agent_names, results[:11]):
             if isinstance(res, Exception):
                 logger.error(f"[{audit_id}] Agent '{name}' raised: {type(res).__name__}: {res}")
 
@@ -5086,11 +5465,12 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
             gbp_results,
             citation_results,
             rank_results,
-        ) = results[:10]
-        blog_results = results[10] if request.include_blog else None
+            page_analysis_results,
+        ) = results[:11]
+        blog_results = results[11] if request.include_blog else None
 
         elapsed = round(time.time() - start, 1)
-        agents_run = 11 + (1 if request.include_blog else 0)
+        agents_run = 12 + (1 if request.include_blog else 0)
         logger.info(f"[{audit_id}] Audit completed in {elapsed}s ({agents_run} agents)")
 
         agents_dict = {
@@ -5109,27 +5489,46 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
         if blog_results:
             agents_dict["blog_writer"] = blog_results
 
-        # Build per-page breakdown for site crawl results
-        pages_crawled_section = [
-            {
-                "url": p["url"],
-                "title": p.get("title", ""),
-                "meta_description": p.get("meta_description", ""),
-                "h1": p.get("h1", ""),
-                "word_count": p.get("word_count", 0),
-                "issues": [
-                    issue for issue in [
-                        "Missing title" if not p.get("title") else None,
-                        "Missing meta description" if not p.get("meta_description") else None,
-                        "Missing H1" if not p.get("h1") else None,
-                        "Thin content (<300 words)" if p.get("word_count", 0) < 300 else None,
-                    ]
-                    if issue is not None
-                ],
-            }
-            for p in crawled_pages
-        ]
+        # Ensure page_analysis_results is a dict (could be {} from exception fallback)
+        if not isinstance(page_analysis_results, dict):
+            page_analysis_results = {}
 
+        # Build site_crawl summary with per-page breakdown
+        from urllib.parse import urlparse as _urlparse
+        site_crawl_pages = []
+        for p in crawled_pages:
+            p_url = p.get("url", "")
+            p_path = _urlparse(p_url).path.rstrip("/") or "/"
+            pa = page_analysis_results.get(p_path, {})
+            issues = [
+                issue for issue in [
+                    "Missing title" if not p.get("title") else None,
+                    "Missing meta description" if not p.get("meta_description") else None,
+                    "Missing H1" if not p.get("h1") else None,
+                    "Thin content (<300 words)" if p.get("word_count", 0) < 300 else None,
+                ]
+                if issue is not None
+            ]
+            # Merge issues from per-page analysis
+            if pa.get("issues"):
+                issues = list(set(issues + pa["issues"]))
+            site_crawl_pages.append({
+                "url": p_url,
+                "title": p.get("title", ""),
+                "type": p.get("page_type", "Page"),
+                "score": pa.get("page_score", 0),
+                "word_count": p.get("word_count", 0),
+                "issues_count": len(issues),
+                "top_issue": issues[0] if issues else None,
+            })
+
+        site_crawl = {
+            "pages_found": len(crawled_pages),
+            "pages_analyzed": len(page_analysis_results),
+            "pages": site_crawl_pages,
+        }
+
+        # Build service keywords + schema recommendations (pure functions)
         # Calculate structured scores and step data
         scores = calculate_pillar_scores(agents_dict)
         score_details = build_score_details(agents_dict)
@@ -5152,6 +5551,10 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
         content_data = build_content_data(agents_dict)
         post_calendar = build_post_calendar(request_data, keyword_data)
         auto_detected_section = build_auto_detected(request, auto_detected, agents_dict)
+
+        # Pure function outputs: per-service keyword targets + schema recommendations
+        service_keywords = build_service_keywords(profile_services, request.location, keyword_data, crawled_pages)
+        schema_recs = build_schema_recommendations(crawled_pages)
 
         report = {
             "audit_id": audit_id,
@@ -5182,11 +5585,16 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
             "quick_wins": structured_wins,
             "pillars": pillars,
             "seo_tasks": seo_tasks,
+            # Full-site crawl data
+            "site_crawl": site_crawl,
+            "per_page_analysis": page_analysis_results,
+            "service_keywords": service_keywords,
+            "schema_recommendations": schema_recs,
             # Backward compat
             "local_seo_score": scores["overall"],
             "domain": request.domain or "",
             "site_aggregate": crawl_aggregate,
-            "pages_crawled": pages_crawled_section,
+            "pages_crawled": site_crawl["pages"],
             # Raw agent data (for debugging / advanced views)
             "agents": agents_dict,
             "summary": {
