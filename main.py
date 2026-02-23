@@ -2836,17 +2836,17 @@ Return JSON with EXACTLY these keys:
   ],
   "current_backlinks": [
     {{
-      "source": "<likely directory or citation listing e.g. Yelp, Google Business, Facebook>",
-      "da": <estimated DA of that source>,
+      "source": "<likely directory or citation — MUST include 5-10 entries: estimate common listings like Google Business Profile (DA 94), Yelp (DA 93), Facebook (DA 96), BBB (DA 90), Yellow Pages (DA 88), and industry-specific directories for this business type>",
+      "da": <DA of the directory — use real DA values for known directories>,
       "type": "follow|nofollow",
-      "anchor": "<likely anchor text>",
+      "anchor": "<likely anchor text e.g. business name>",
       "first_seen": "<estimated date YYYY-MM or 'Unknown'>",
       "status": "active|likely-active|unverified"
     }}
   ]
 }}
 
-For current_backlinks: estimate 5-10 likely backlinks this business type would have based on scraped signals, common directory listings (Google Business Profile, Yelp, Facebook, BBB, industry directories), and any links visible on the page. Use realistic DA values for known directories."""
+IMPORTANT: The "current_backlinks" array is REQUIRED. Include 5-10 estimated backlinks based on common directory listings for this business type."""
 
 
 @app.post("/agents/backlink-analysis")
@@ -2924,7 +2924,7 @@ async def backlink_analysis_agent(request: AuditRequest):
         serp_presence=serp_presence,
     )
 
-    recommendations = await call_claude(BACKLINK_SYSTEM, prompt, max_tokens=1500)
+    recommendations = await call_claude(BACKLINK_SYSTEM, prompt, max_tokens=2500)
 
     return {
         "agent": "backlink_analysis",
