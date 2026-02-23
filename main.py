@@ -6123,6 +6123,177 @@ async def keyword_gap_analysis(
 
 
 # =============================================================================
+# Schema Generator (per-page JSON-LD)
+# =============================================================================
+
+SCHEMA_GENERATE_SYSTEM = (
+    "You are an expert SEO schema markup specialist. You generate valid JSON-LD "
+    "structured data for local business websites following schema.org standards. "
+    "Respond with valid JSON only — no markdown fences, no extra text."
+)
+
+
+@app.post("/api/generate-schema")
+async def generate_schema(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Generate JSON-LD schema markup for a page."""
+    page_url = (body.get("page_url") or "").strip()
+    schema_types = body.get("schema_types", [])
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+    keyword = (body.get("keyword") or "").strip()
+
+    if not schema_types:
+        raise HTTPException(status_code=400, detail="schema_types is required")
+
+    prompt = (
+        f"Generate JSON-LD schema markup for these schema types: {', '.join(schema_types)}\n\n"
+        f"Page URL: {page_url or 'homepage'}\n"
+        f"Business: {business_name or 'Local Business'} ({business_type})\n"
+        f"Location: {location or 'N/A'}\n"
+        f"Primary keyword: {keyword or 'N/A'}\n\n"
+        f"Return JSON with this structure:\n"
+        f'{{\n'
+        f'  "schemas": [\n'
+        f'    {{\n'
+        f'      "type": "LocalBusiness",\n'
+        f'      "description": "one-line description of what this schema does for SEO",\n'
+        f'      "json_ld": "<complete, valid JSON-LD script tag content as a string>"\n'
+        f'    }}\n'
+        f'  ]\n'
+        f'}}\n\n'
+        f"Rules:\n"
+        f"- Each json_ld value must be a complete, valid JSON-LD object (as a JSON string)\n"
+        f"- Use realistic placeholder data based on the business details provided\n"
+        f"- Include @context, @type, and all recommended properties for each schema type\n"
+        f"- For FAQ schema, generate 3-5 realistic questions relevant to a {business_type}\n"
+        f"- For Review/AggregateRating, use realistic example data\n"
+        f"- Generate one schema object per requested type"
+    )
+
+    result = await call_claude(SCHEMA_GENERATE_SYSTEM, prompt, max_tokens=3000)
+
+    if isinstance(result, dict) and "schemas" in result:
+        return result
+    if isinstance(result, dict) and "error" not in result:
+        return {"schemas": [result]}
+    return {"schemas": [], "error": result.get("error") if isinstance(result, dict) else "Could not parse result"}
+
+
+# =============================================================================
+# Competitor Outrank (content generation to beat competitor)
+# =============================================================================
+
+OUTRANK_SYSTEM = (
+    "You are an elite SEO content strategist. You analyse top-ranking competitor pages "
+    "and create superior content designed to outrank them. You combine competitor analysis, "
+    "keyword optimization, and conversion-focused copywriting. "
+    "Respond with valid JSON only — no markdown fences, no extra text."
+)
+
+
+@app.post("/api/outrank-competitor")
+async def outrank_competitor(
+    body: dict,
+    current_user: Optional[CurrentUser] = Depends(get_optional_user),
+):
+    """Analyse a competitor page and generate content to outrank it."""
+    competitor_url = (body.get("competitor_url") or "").strip()
+    keyword = (body.get("keyword") or "").strip()
+    your_url = (body.get("your_url") or "").strip()
+    business_name = (body.get("business_name") or "").strip()
+    business_type = (body.get("business_type") or "local business").strip()
+    location = (body.get("location") or "").strip()
+
+    if not competitor_url or not keyword:
+        raise HTTPException(status_code=400, detail="competitor_url and keyword are required")
+
+    # Scrape competitor
+    comp_data = await scrape_page(competitor_url)
+    if not comp_data.get("success"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not scrape competitor URL: {comp_data.get('error', 'unknown error')}",
+        )
+
+    prompt = (
+        f"Analyse this competitor page and create BETTER content to outrank it for \"{keyword}\".\n\n"
+        f"COMPETITOR PAGE:\n"
+        f"- URL: {competitor_url}\n"
+        f"- Title: {comp_data.get('title', 'N/A')}\n"
+        f"- H1: {comp_data.get('h1', 'N/A')}\n"
+        f"- Meta: {comp_data.get('meta_description', 'N/A')}\n"
+        f"- Word count: {comp_data.get('word_count', 0)}\n"
+        f"- Headings: {json.dumps(comp_data.get('headings', [])[:20])}\n"
+        f"- Content: {comp_data.get('content', '')[:2500]}\n\n"
+        f"YOUR BUSINESS:\n"
+        f"- Name: {business_name or 'Local Business'}\n"
+        f"- Type: {business_type}\n"
+        f"- Location: {location}\n"
+        f"- Your page: {your_url or 'new page'}\n\n"
+        f"Return JSON:\n"
+        f'{{\n'
+        f'  "competitor_analysis": {{\n'
+        f'    "title": "{comp_data.get("title", "")}",\n'
+        f'    "word_count": {comp_data.get("word_count", 0)},\n'
+        f'    "strengths": ["what they do well"],\n'
+        f'    "weaknesses": ["what they miss or do poorly"],\n'
+        f'    "keywords_targeted": ["their main keywords"]\n'
+        f'  }},\n'
+        f'  "generated_content": "<full SEO-optimized page content, 1500+ words, with [H2: ...] and [H3: ...] heading markers>",\n'
+        f'  "meta_title": "<60 chars, include keyword>",\n'
+        f'  "meta_description": "<155 chars, compelling with keyword>",\n'
+        f'  "heading_structure": [{{"tag": "H1", "text": "..."}}],\n'
+        f'  "word_count": <integer>,\n'
+        f'  "schema_recommendation": "<which schema types to add>",\n'
+        f'  "internal_links": [{{"anchor": "...", "target": "...", "reason": "..."}}],\n'
+        f'  "outrank_strategy": "one paragraph on why this content will outrank the competitor"\n'
+        f'}}\n\n'
+        f"Rules:\n"
+        f"- Content must be LONGER and MORE COMPREHENSIVE than the competitor\n"
+        f"- Include the keyword at 1-2% density naturally\n"
+        f"- Add local signals ({location}) throughout\n"
+        f"- Include a 5-question FAQ section at the end\n"
+        f"- Write for conversion: CTAs, trust signals, social proof placeholders\n"
+        f"- Suggest 3-5 internal links"
+    )
+
+    result = await call_claude(OUTRANK_SYSTEM, prompt, max_tokens=4000)
+
+    if isinstance(result, dict) and "error" not in result:
+        result.setdefault("competitor_analysis", {
+            "title": comp_data.get("title", ""),
+            "word_count": comp_data.get("word_count", 0),
+            "strengths": [],
+            "weaknesses": [],
+            "keywords_targeted": [],
+        })
+        return result
+
+    return {
+        "competitor_analysis": {
+            "title": comp_data.get("title", ""),
+            "word_count": comp_data.get("word_count", 0),
+            "strengths": [],
+            "weaknesses": [],
+            "keywords_targeted": [],
+        },
+        "generated_content": "",
+        "meta_title": "",
+        "meta_description": "",
+        "heading_structure": [],
+        "word_count": 0,
+        "schema_recommendation": "",
+        "internal_links": [],
+        "outrank_strategy": "Analysis could not be completed.",
+        "error": result.get("error") if isinstance(result, dict) else "Could not parse result",
+    }
+
+
+# =============================================================================
 # Health & info
 # =============================================================================
 
