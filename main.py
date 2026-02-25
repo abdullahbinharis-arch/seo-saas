@@ -26,7 +26,8 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
+from fastapi.templating import Jinja2Templates
 import bcrypt as _bcrypt_lib
 from jose import JWTError, jwt as jose_jwt
 from pydantic import BaseModel, field_validator, model_validator
@@ -87,6 +88,8 @@ app = FastAPI(
     description="3-Agent Local SEO Audit Platform",
 )
 
+templates = Jinja2Templates(directory="templates")
+
 # CORS — open for development, lock down for production
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -106,6 +109,22 @@ app.add_middleware(
 async def startup_event():
     init_db()
     logger.info("Database tables ready")
+
+
+# ---------------------------------------------------------------------------
+# Landing page (public)
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def landing_page(request: Request):
+    token = request.cookies.get("access_token")
+    if token:
+        try:
+            jose_jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            return Response(status_code=302, headers={"Location": "/dashboard"})
+        except Exception:
+            pass
+    return templates.TemplateResponse("landing.html", {"request": request})
 
 
 # ---------------------------------------------------------------------------
