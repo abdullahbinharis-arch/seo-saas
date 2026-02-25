@@ -6000,6 +6000,353 @@ def export_audit_pdf(audit_id: str, current_user: CurrentUser = Depends(get_curr
 
 
 # =============================================================================
+# Per-Page SEO Checklist, Issue Details, Technical SEO
+# =============================================================================
+
+
+def _load_audit_data(audit_id: str) -> dict:
+    """Load audit data by ID from in-memory cache or DB. No auth required."""
+    if audit_id in _pending_audits:
+        entry = _pending_audits[audit_id]
+        if entry.get("status") == "completed" and "result" in entry:
+            return entry["result"]
+    db = SessionLocal()
+    try:
+        row = db.query(Audit).filter(Audit.id == audit_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Audit not found")
+        return json.loads(row.results_json)
+    finally:
+        db.close()
+
+
+@app.get("/api/audit/{audit_id}/checklist")
+def get_audit_checklist(audit_id: str, page_url: str = "all"):
+    """Per-page SEO checklist from audit data."""
+    audit = _load_audit_data(audit_id)
+    pages_analysis = audit.get("per_page_analysis", {})
+    site_crawl = audit.get("site_crawl", {})
+    crawled_pages = site_crawl.get("pages", [])
+
+    items = []
+
+    def _add_item(rule: str, status: str, current: str, recommended: str, url: str, details: str = ""):
+        items.append({
+            "rule_name": rule,
+            "status": status,
+            "current_value": current,
+            "recommended_value": recommended,
+            "page_url": url,
+            "details": details,
+        })
+
+    def _check_page(url: str, data: dict):
+        # Title tag
+        title = data.get("title_analysis", {})
+        t_len = title.get("length", len(data.get("title", "")))
+        if 30 <= t_len <= 65:
+            _add_item("Title Tag", "pass", f"{t_len} chars", "30–65 chars", url)
+        elif t_len == 0:
+            _add_item("Title Tag", "fail", "Missing", "30–65 chars", url, "Page has no title tag")
+        else:
+            _add_item("Title Tag", "warn", f"{t_len} chars", "30–65 chars", url, "Title length outside optimal range")
+
+        # Meta description
+        meta = data.get("meta_analysis", {})
+        m_len = meta.get("length", len(data.get("meta_description", "")))
+        if 120 <= m_len <= 160:
+            _add_item("Meta Description", "pass", f"{m_len} chars", "120–160 chars", url)
+        elif m_len == 0:
+            _add_item("Meta Description", "fail", "Missing", "120–160 chars", url, "Page has no meta description")
+        else:
+            _add_item("Meta Description", "warn", f"{m_len} chars", "120–160 chars", url)
+
+        # H1 tag
+        h1_tags = data.get("h1_tags", data.get("headings", {}).get("h1", []))
+        h1_count = len(h1_tags) if isinstance(h1_tags, list) else (1 if h1_tags else 0)
+        if h1_count == 1:
+            _add_item("H1 Tag", "pass", f"{h1_count} H1", "Exactly 1 H1", url)
+        elif h1_count == 0:
+            _add_item("H1 Tag", "fail", "Missing", "Exactly 1 H1", url, "Page has no H1 tag")
+        else:
+            _add_item("H1 Tag", "warn", f"{h1_count} H1s", "Exactly 1 H1", url, "Multiple H1 tags found")
+
+        # Word count
+        wc = data.get("word_count", 0)
+        if wc >= 500:
+            _add_item("Content Length", "pass", f"{wc} words", "500+ words", url)
+        elif wc >= 200:
+            _add_item("Content Length", "warn", f"{wc} words", "500+ words", url, "Thin content — consider expanding")
+        else:
+            _add_item("Content Length", "fail", f"{wc} words", "500+ words", url, "Very thin content")
+
+        # Images alt text
+        images = data.get("images", [])
+        missing_alt = [img for img in images if not img.get("alt")]
+        if images and not missing_alt:
+            _add_item("Image Alt Text", "pass", "All images have alt", "All images need alt", url)
+        elif missing_alt:
+            _add_item("Image Alt Text", "warn", f"{len(missing_alt)} missing alt", "All images need alt", url,
+                       f"{len(missing_alt)} of {len(images)} images missing alt text")
+
+        # Issues from crawl
+        for issue in data.get("issues", []):
+            severity = issue.get("severity", "warning")
+            status = "fail" if severity == "error" else "warn"
+            _add_item(issue.get("type", "Issue"), status, issue.get("description", ""), issue.get("recommendation", ""), url)
+
+    if page_url == "all":
+        # Aggregate across all pages
+        for url, data in pages_analysis.items():
+            _check_page(url, data)
+        # Also check crawled pages not in per_page_analysis
+        for cp in crawled_pages:
+            cp_url = cp.get("url", "")
+            if cp_url and cp_url not in pages_analysis:
+                _check_page(cp_url, cp)
+    else:
+        data = pages_analysis.get(page_url, {})
+        if not data:
+            # Try finding in crawled_pages
+            for cp in crawled_pages:
+                if cp.get("url") == page_url:
+                    data = cp
+                    break
+        if data:
+            _check_page(page_url, data)
+
+    return {"items": items, "page_url": page_url, "total": len(items)}
+
+
+@app.get("/api/audit/{audit_id}/issue-details")
+def get_issue_details(audit_id: str, rule_name: str, page_url: str = "all"):
+    """Detailed breakdown of a specific issue across pages."""
+    audit = _load_audit_data(audit_id)
+    pages_analysis = audit.get("per_page_analysis", {})
+    site_crawl = audit.get("site_crawl", {})
+    crawled_pages = site_crawl.get("pages", [])
+
+    detail_items = []
+    rule_lower = rule_name.lower().replace(" ", "_").replace("-", "_")
+
+    # Broken links
+    if "broken" in rule_lower or "link" in rule_lower:
+        broken = site_crawl.get("broken_links", [])
+        for bl in broken:
+            detail_items.append({
+                "page_url": bl.get("found_on", bl.get("source", "")),
+                "value": bl.get("url", bl.get("href", "")),
+                "status_code": bl.get("status_code", 0),
+                "anchor_text": bl.get("anchor", bl.get("anchor_text", "")),
+            })
+
+    # Missing meta / title
+    elif "meta" in rule_lower or "title" in rule_lower or "h1" in rule_lower:
+        pages_to_check = pages_analysis if page_url == "all" else {page_url: pages_analysis.get(page_url, {})}
+        for url, data in pages_to_check.items():
+            if not data:
+                continue
+            if "title" in rule_lower:
+                val = data.get("title", "")
+                length = len(val)
+                if length == 0 or length > 65 or length < 30:
+                    detail_items.append({"page_url": url, "value": val or "(missing)", "length": length})
+            elif "meta" in rule_lower:
+                val = data.get("meta_description", "")
+                length = len(val)
+                if length == 0 or length > 160 or length < 120:
+                    detail_items.append({"page_url": url, "value": val or "(missing)", "length": length})
+            elif "h1" in rule_lower:
+                h1s = data.get("h1_tags", data.get("headings", {}).get("h1", []))
+                count = len(h1s) if isinstance(h1s, list) else (1 if h1s else 0)
+                if count != 1:
+                    detail_items.append({"page_url": url, "value": str(h1s) if h1s else "(missing)", "count": count})
+
+    # Content length
+    elif "content" in rule_lower or "word" in rule_lower:
+        pages_to_check = pages_analysis if page_url == "all" else {page_url: pages_analysis.get(page_url, {})}
+        for url, data in pages_to_check.items():
+            wc = data.get("word_count", 0) if data else 0
+            if wc < 500:
+                detail_items.append({"page_url": url, "word_count": wc})
+
+    # Image alt
+    elif "image" in rule_lower or "alt" in rule_lower:
+        pages_to_check = pages_analysis if page_url == "all" else {page_url: pages_analysis.get(page_url, {})}
+        for url, data in pages_to_check.items():
+            if not data:
+                continue
+            for img in data.get("images", []):
+                if not img.get("alt"):
+                    detail_items.append({"page_url": url, "src": img.get("src", ""), "alt": "(missing)"})
+
+    # Generic issues
+    else:
+        pages_to_check = pages_analysis if page_url == "all" else {page_url: pages_analysis.get(page_url, {})}
+        for url, data in pages_to_check.items():
+            if not data:
+                continue
+            for issue in data.get("issues", []):
+                if rule_lower in issue.get("type", "").lower().replace(" ", "_").replace("-", "_"):
+                    detail_items.append({"page_url": url, "description": issue.get("description", ""), "recommendation": issue.get("recommendation", "")})
+
+    # Determine overall status
+    status = "pass" if not detail_items else "fail"
+
+    return {
+        "issue_name": rule_name,
+        "status": status,
+        "total_count": len(detail_items),
+        "items": detail_items,
+    }
+
+
+@app.get("/api/audit/{audit_id}/technical-seo")
+def get_technical_seo(audit_id: str):
+    """Categorized technical SEO issues from audit data."""
+    audit = _load_audit_data(audit_id)
+    pages_analysis = audit.get("per_page_analysis", {})
+    site_crawl = audit.get("site_crawl", {})
+    tech_agent = audit.get("agents", {}).get("technical_seo", {})
+
+    errors = 0
+    warnings = 0
+    passed = 0
+
+    categories = []
+
+    def _cat(name: str, icon: str, items_list: list, severity: str = "warning"):
+        nonlocal errors, warnings, passed
+        count = len(items_list)
+        if count == 0:
+            passed += 1
+            return
+        if severity == "error":
+            errors += count
+        else:
+            warnings += count
+        categories.append({
+            "name": name, "icon": icon, "count": count, "severity": severity, "items": items_list,
+        })
+
+    # 1. Broken links
+    broken = site_crawl.get("broken_links", [])
+    _cat("Broken Links", "link-slash", [
+        {"page_url": b.get("found_on", b.get("source", "")), "url": b.get("url", b.get("href", "")),
+         "status_code": b.get("status_code", 0), "anchor": b.get("anchor", "")}
+        for b in broken
+    ], "error")
+
+    # 2. Redirects
+    redirects = [p for p in site_crawl.get("pages", []) if p.get("status_code") in (301, 302, 307, 308)]
+    _cat("Redirects", "arrow-right-arrow-left", [
+        {"page_url": r.get("url", ""), "status_code": r.get("status_code", 0), "redirect_to": r.get("redirect_url", "")}
+        for r in redirects
+    ], "warning")
+
+    # 3. HTTP status errors
+    http_errors = [p for p in site_crawl.get("pages", []) if p.get("status_code", 200) >= 400]
+    _cat("HTTP Status Errors", "circle-exclamation", [
+        {"page_url": p.get("url", ""), "status_code": p.get("status_code", 0)}
+        for p in http_errors
+    ], "error")
+
+    # 4. Missing title tags
+    missing_titles = []
+    for url, data in pages_analysis.items():
+        title = data.get("title", "")
+        if not title:
+            missing_titles.append({"page_url": url, "value": "(missing)"})
+    _cat("Missing Title Tags", "heading", missing_titles, "error")
+
+    # 5. Missing meta descriptions
+    missing_metas = []
+    for url, data in pages_analysis.items():
+        meta = data.get("meta_description", "")
+        if not meta:
+            missing_metas.append({"page_url": url, "value": "(missing)"})
+    _cat("Missing Meta Descriptions", "file-lines", missing_metas, "warning")
+
+    # 6. Missing H1 tags
+    missing_h1s = []
+    for url, data in pages_analysis.items():
+        h1s = data.get("h1_tags", data.get("headings", {}).get("h1", []))
+        count = len(h1s) if isinstance(h1s, list) else (1 if h1s else 0)
+        if count == 0:
+            missing_h1s.append({"page_url": url, "value": "(missing)"})
+        elif count > 1:
+            missing_h1s.append({"page_url": url, "value": f"{count} H1 tags", "details": str(h1s)})
+    _cat("H1 Tag Issues", "h1", missing_h1s, "warning")
+
+    # 7. Image issues
+    img_issues = []
+    for url, data in pages_analysis.items():
+        for img in data.get("images", []):
+            if not img.get("alt"):
+                img_issues.append({"page_url": url, "src": img.get("src", ""), "issue": "Missing alt text"})
+    _cat("Image Optimization", "image", img_issues, "warning")
+
+    # 8. Thin content
+    thin = []
+    for url, data in pages_analysis.items():
+        wc = data.get("word_count", 0)
+        if wc < 300:
+            thin.append({"page_url": url, "word_count": wc})
+    _cat("Thin Content", "file-minus", thin, "warning")
+
+    # 9. Security (HTTPS)
+    security_items = []
+    for p in site_crawl.get("pages", []):
+        if p.get("url", "").startswith("http://"):
+            security_items.append({"page_url": p["url"], "issue": "Not using HTTPS"})
+    _cat("Security (HTTPS)", "shield", security_items, "error")
+
+    # 10. Duplicate content
+    dup_items = []
+    seen_titles = {}
+    for url, data in pages_analysis.items():
+        title = data.get("title", "")
+        if title:
+            if title in seen_titles:
+                dup_items.append({"page_url": url, "duplicate_of": seen_titles[title], "title": title})
+            else:
+                seen_titles[title] = url
+    _cat("Duplicate Content", "copy", dup_items, "warning")
+
+    # 11. Technical agent findings
+    if tech_agent:
+        tech_issues = tech_agent.get("issues", tech_agent.get("recommendations", []))
+        if isinstance(tech_issues, list):
+            agent_items = [
+                {"description": i.get("title", i.get("description", "")),
+                 "recommendation": i.get("recommendation", i.get("fix", "")),
+                 "severity": i.get("severity", i.get("priority", "warning"))}
+                for i in tech_issues if isinstance(i, dict)
+            ]
+            _cat("Technical Agent Findings", "robot", agent_items, "warning")
+
+    # 12. Performance
+    perf = tech_agent.get("performance", {})
+    perf_items = []
+    if perf.get("score") is not None and perf["score"] < 50:
+        perf_items.append({"metric": "Performance Score", "value": perf["score"], "threshold": 50})
+    for metric_key in ("largest_contentful_paint", "first_contentful_paint", "cumulative_layout_shift"):
+        val = perf.get(metric_key)
+        if val and isinstance(val, (int, float)):
+            perf_items.append({"metric": metric_key.replace("_", " ").title(), "value": val})
+    _cat("Performance", "gauge-high", perf_items, "warning")
+
+    # Count passed categories (12 total - categories with issues)
+    total_categories = 12
+    passed = total_categories - len(categories)
+
+    return {
+        "summary": {"errors": errors, "warnings": warnings, "passed": passed},
+        "categories": categories,
+    }
+
+
+# =============================================================================
 # Content Generation Endpoints (Post Creator & Content Writer)
 # =============================================================================
 
@@ -6085,6 +6432,7 @@ class SeoContentRequest(BaseModel):
     location: str = "Toronto, Canada"
     target_url: str = ""
     services: Optional[str] = None
+    competitor_urls: list[str] = []  # Up to 5 direct competitor URLs
 
 
 class SeoScoreRequest(BaseModel):
@@ -6874,15 +7222,68 @@ async def seo_content_generate(
     services = request.services or request.business_type
 
     # Step 1: Competitor analysis
-    competitor_data = await _seo_analyze_competitors(
-        keyword=keyword,
-        city=city,
-        country=country,
-        claude_caller=call_claude,
-        fetch_competitors_fn=fetch_competitors,
-        scrape_page_fn=scrape_page,
-        business_type=request.business_type,
-    )
+    # If competitor_urls provided, scrape them directly instead of using SerpApi
+    direct_urls = [u.strip() for u in (request.competitor_urls or []) if u.strip()][:5]
+    if direct_urls:
+        # Scrape provided competitor URLs directly
+        import asyncio as _asyncio
+        scrape_tasks = [scrape_page(u) for u in direct_urls]
+        pages = await _asyncio.gather(*scrape_tasks, return_exceptions=True)
+        scraped = [p for p in pages if isinstance(p, dict) and p.get("success")]
+
+        if scraped:
+            word_counts = [p.get("word_count", 0) for p in scraped if p.get("word_count", 0) > 0]
+            avg_words = round(sum(word_counts) / len(word_counts)) if word_counts else 1200
+            target_words = max(1100, min(3000, round(avg_words * 1.25 / 100) * 100))
+
+            comp_data_parts = []
+            for p in scraped:
+                headings = [h["text"] for h in p.get("headings", [])[:10]]
+                comp_data_parts.append(
+                    f"URL: {p.get('url', '')}\n"
+                    f"Title: {p.get('title', 'N/A')}\n"
+                    f"Word Count: {p.get('word_count', 0)}\n"
+                    f"H1: {p.get('h1', 'N/A')}\n"
+                    f"Headings: {', '.join(headings)}\n"
+                    f"Content preview: {p.get('content', '')[:600]}"
+                )
+            comp_data_str = "\n\n---\n\n".join(comp_data_parts)
+            from seo_engine import COMPETITOR_ANALYSIS_PROMPT
+            analysis = await call_claude(
+                "You are an SEO analyst. Respond with valid JSON only.",
+                COMPETITOR_ANALYSIS_PROMPT.format(
+                    keyword=keyword, city=city, country=country,
+                    competitor_data=comp_data_str,
+                ),
+                max_tokens=2000,
+            )
+            if not isinstance(analysis, dict) or "averages" not in analysis:
+                analysis = {
+                    "competitors": [{"url": p.get("url", ""), "word_count": p.get("word_count", 0)} for p in scraped],
+                    "averages": {"word_count": avg_words, "h2_count": 5, "keyword_count": 8, "faq_percentage": 30},
+                    "targets": {"word_count": target_words, "h2_count": 6, "min_keyword_count": 8},
+                    "must_have_topics": [], "differentiation_topics": [], "gap_topics": [], "semantic_keywords": [],
+                }
+            analysis.setdefault("targets", {})
+            analysis["targets"]["word_count"] = target_words
+            analysis.setdefault("averages", {})
+            analysis["averages"]["word_count"] = avg_words
+            analysis["competitors_analyzed"] = len(scraped)
+            analysis["source"] = "direct_urls"
+            competitor_data = analysis
+        else:
+            # All direct scrapes failed — fall back to SerpApi
+            competitor_data = await _seo_analyze_competitors(
+                keyword=keyword, city=city, country=country,
+                claude_caller=call_claude, fetch_competitors_fn=fetch_competitors,
+                scrape_page_fn=scrape_page, business_type=request.business_type,
+            )
+    else:
+        competitor_data = await _seo_analyze_competitors(
+            keyword=keyword, city=city, country=country,
+            claude_caller=call_claude, fetch_competitors_fn=fetch_competitors,
+            scrape_page_fn=scrape_page, business_type=request.business_type,
+        )
 
     # Step 2: Generate based on content type
     if request.content_type == "service" and request.service_name:
