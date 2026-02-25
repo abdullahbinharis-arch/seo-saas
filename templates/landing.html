@@ -184,9 +184,9 @@
     .step{display:flex;gap:28px;align-items:flex-start;margin-bottom:60px;position:relative;}
     .step:last-child{margin-bottom:0;}
     .step-num{width:56px;height:56px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-family:'Outfit';font-weight:800;font-size:22px;flex-shrink:0;position:relative;z-index:2;}
-    .step:nth-child(1) .step-num{background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.2);color:var(--emerald-bright);}
-    .step:nth-child(2) .step-num{background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);color:var(--blue-bright);}
-    .step:nth-child(3) .step-num{background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.2);color:var(--violet-bright);}
+    .step.step-emerald .step-num{background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.2);color:var(--emerald-bright);}
+    .step.step-blue .step-num{background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);color:var(--blue-bright);}
+    .step.step-violet .step-num{background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.2);color:var(--violet-bright);}
     .step-content{padding-top:6px;}
     .step-title{font-family:'Outfit';font-weight:700;font-size:22px;letter-spacing:-0.5px;margin-bottom:8px;}
     .step-desc{font-size:14.5px;color:var(--text-secondary);line-height:1.6;}
@@ -376,20 +376,22 @@
 <nav class="nav" id="navbar">
   <a href="#" class="nav-logo">
     <div class="nav-logo-icon">
-      <svg viewBox="0 0 32 32" fill="none">
-        <circle cx="16" cy="16" r="4" fill="#10b981"/>
-        <circle cx="16" cy="5" r="2.5" fill="#6ee7b7" opacity="0.7"/>
-        <circle cx="25.5" cy="10.5" r="2.5" fill="#6ee7b7" opacity="0.5"/>
-        <circle cx="25.5" cy="21.5" r="2.5" fill="#6ee7b7" opacity="0.4"/>
-        <circle cx="16" cy="27" r="2.5" fill="#6ee7b7" opacity="0.6"/>
-        <circle cx="6.5" cy="21.5" r="2.5" fill="#6ee7b7" opacity="0.5"/>
-        <circle cx="6.5" cy="10.5" r="2.5" fill="#6ee7b7" opacity="0.7"/>
-        <line x1="16" y1="12" x2="16" y2="7.5" stroke="#10b981" stroke-width="1" opacity="0.4"/>
-        <line x1="19.5" y1="13.5" x2="23.5" y2="11" stroke="#10b981" stroke-width="1" opacity="0.3"/>
-        <line x1="19.5" y1="18.5" x2="23.5" y2="21" stroke="#10b981" stroke-width="1" opacity="0.25"/>
-        <line x1="16" y1="20" x2="16" y2="24.5" stroke="#10b981" stroke-width="1" opacity="0.35"/>
-        <line x1="12.5" y1="18.5" x2="8.5" y2="21" stroke="#10b981" stroke-width="1" opacity="0.3"/>
-        <line x1="12.5" y1="13.5" x2="8.5" y2="11" stroke="#10b981" stroke-width="1" opacity="0.4"/>
+      <svg viewBox="0 0 100 100" fill="none">
+        <circle cx="50" cy="50" r="46" stroke="#10b981" stroke-width="1.5" opacity="0.12"/>
+        <line x1="50" y1="50" x2="22" y2="25" stroke="#3d8b6e" stroke-width="1.2" opacity="0.35"/>
+        <line x1="50" y1="50" x2="78" y2="25" stroke="#4a8a9e" stroke-width="1.2" opacity="0.35"/>
+        <line x1="50" y1="50" x2="22" y2="75" stroke="#3d8b6e" stroke-width="1.2" opacity="0.25"/>
+        <line x1="50" y1="50" x2="78" y2="75" stroke="#4a8a9e" stroke-width="1.2" opacity="0.25"/>
+        <circle cx="22" cy="25" r="4.5" fill="#3daa7a" opacity="0.7"/>
+        <circle cx="78" cy="25" r="4.5" fill="#4a9ab5" opacity="0.7"/>
+        <circle cx="22" cy="75" r="4" fill="#3d8b6e" opacity="0.4"/>
+        <circle cx="78" cy="75" r="4" fill="#6670a8" opacity="0.4"/>
+        <circle cx="50" cy="12" r="3.5" fill="#4d8a6e" opacity="0.5"/>
+        <circle cx="50" cy="50" r="18" fill="#10b981" opacity="0.08"/>
+        <circle cx="50" cy="50" r="13" fill="#10b981" opacity="0.12"/>
+        <circle cx="50" cy="50" r="10" fill="#10b981"/>
+        <path d="M50 43.5c-2.5 0-4.5 2-4.5 4.5s4.5 9 4.5 9 4.5-6.5 4.5-9-2-4.5-4.5-4.5z" fill="white" opacity="0.95"/>
+        <circle cx="50" cy="48" r="1.5" fill="#10b981"/>
       </svg>
     </div>
     <span><span class="local">Local</span><span class="rankr">Rankr</span></span>
@@ -674,7 +676,7 @@
   <div class="steps-container">
     <div class="steps-line"></div>
 
-    <div class="step reveal-left">
+    <div class="step step-emerald reveal-left">
       <div class="step-num">1</div>
       <div class="step-content">
         <div class="step-title">Run Your Full-Site Audit</div>
@@ -682,7 +684,7 @@
       </div>
     </div>
 
-    <div class="step reveal-left" style="transition-delay:0.15s;">
+    <div class="step step-blue reveal-left" style="transition-delay:0.15s;">
       <div class="step-num">2</div>
       <div class="step-content">
         <div class="step-title">Discover Gaps & Opportunities</div>
@@ -690,7 +692,7 @@
       </div>
     </div>
 
-    <div class="step reveal-left" style="transition-delay:0.3s;">
+    <div class="step step-violet reveal-left" style="transition-delay:0.3s;">
       <div class="step-num">3</div>
       <div class="step-content">
         <div class="step-title">Generate & Publish AI Content</div>
