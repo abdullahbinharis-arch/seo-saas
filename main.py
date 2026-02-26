@@ -58,9 +58,14 @@ MOZ_ACCESS_ID = os.getenv("MOZ_ACCESS_ID", "")
 MOZ_SECRET_KEY = os.getenv("MOZ_SECRET_KEY", "")
 MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "50"))
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL_FAST = os.getenv("OPENROUTER_MODEL_FAST", "google/gemini-2.0-flash-001")
+OPENROUTER_MODEL_SMART = os.getenv("OPENROUTER_MODEL_SMART", "google/gemini-2.0-flash-001")
 
-if not ANTHROPIC_API_KEY:
-    logger.warning("⚠️  ANTHROPIC_API_KEY is not set — Claude calls will fail")
+if not ANTHROPIC_API_KEY and not OPENROUTER_API_KEY:
+    logger.warning("⚠️  Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY is set — all AI calls will fail")
+elif not ANTHROPIC_API_KEY:
+    logger.warning("⚠️  ANTHROPIC_API_KEY is not set — using OpenRouter as primary")
 if not SERPAPI_KEY:
     logger.warning("⚠️  SERPAPI_KEY is not set — competitor research will fail")
 if not JWT_SECRET:
@@ -139,6 +144,10 @@ RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
 
 # In-memory store for background audit tasks: audit_id -> {"status": ..., "result": ...}
 _pending_audits: dict[str, dict] = {}
+
+# Citation verification cache: (normalized_biz_name, directory_name) -> {"result": ..., "ts": float}
+_citation_cache: dict[tuple[str, str], dict] = {}
+_CITATION_CACHE_TTL = 6 * 3600  # 6 hours
 RATE_LIMIT_WHITELIST: set[str] = {
     e.strip().lower()
     for e in os.getenv("RATE_LIMIT_WHITELIST", "").split(",")
@@ -195,6 +204,8 @@ class AuditRequest(BaseModel):
     services: Optional[list[str]] = None
     user_id: Optional[str] = None
     profile_id: Optional[str] = None
+    phone: Optional[str] = None       # for citation NAP verification
+    address: Optional[str] = None     # for citation NAP verification
     include_blog: bool = False  # opt-in: adds ~40s but generates a full blog post
 
     @field_validator("keyword")
@@ -1078,13 +1089,15 @@ async def crawl_site(start_url: str, max_pages: int = 50) -> list[dict]:
     """
     try:
         import advertools  # noqa: F401 — check if installed
-        return await _crawl_site_advertools(start_url, max_pages)
+        pages = await _crawl_site_advertools(start_url, max_pages)
+        if pages:
+            return pages
+        logger.warning("advertools crawl returned 0 pages — falling back to BFS crawler")
     except ImportError:
         logger.info("advertools not installed — using built-in BFS crawler")
-        return await crawl_site_basic(start_url, max_pages)
     except Exception as e:
         logger.warning(f"advertools crawl failed ({e}) — falling back to BFS crawler")
-        return await crawl_site_basic(start_url, max_pages)
+    return await crawl_site_basic(start_url, max_pages)
 
 
 async def _crawl_site_advertools(start_url: str, max_pages: int = 50) -> list[dict]:
@@ -1963,6 +1976,9 @@ async def call_claude(
             is_billing = "credit balance" in err_str.lower() or "billing" in err_str.lower()
             if is_billing:
                 logger.error(f"Claude billing error (not retrying): {e}")
+                if OPENROUTER_API_KEY:
+                    logger.info("Falling back to OpenRouter...")
+                    return await _call_openrouter(system, prompt, max_tokens, retries=2, return_raw=return_raw, model=use_model)
                 break
             is_rate_limit = "rate_limit" in err_str.lower() or "429" in err_str
             wait = 30 if is_rate_limit else 2 * attempt
@@ -1974,6 +1990,74 @@ async def call_claude(
                 await asyncio.sleep(wait)
 
     logger.error(f"Claude call failed after {retries} attempts: {last_error}")
+    return "" if return_raw else {"error": str(last_error)}
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter fallback helper
+# ---------------------------------------------------------------------------
+
+async def _call_openrouter(
+    system: str,
+    prompt: str,
+    max_tokens: int = 2000,
+    retries: int = 2,
+    return_raw: bool = False,
+    model: str | None = None,
+) -> dict | str:
+    """
+    Call OpenRouter as a fallback when Claude billing fails.
+    Same interface as call_claude() so callers are unaffected.
+    """
+    import httpx
+
+    # Map Claude model choice to the corresponding OpenRouter model
+    if model == CLAUDE_MODEL_SMART:
+        or_model = OPENROUTER_MODEL_SMART
+    else:
+        or_model = OPENROUTER_MODEL_FAST
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": or_model,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            raw = data["choices"][0]["message"]["content"]
+            logger.info(f"OpenRouter ({or_model}) returned {len(raw)} chars")
+            if return_raw:
+                return raw
+            return extract_json(raw)
+
+        except Exception as e:
+            last_error = e
+            wait = 2 * attempt
+            logger.warning(
+                f"OpenRouter call attempt {attempt}/{retries} failed (retrying in {wait} s): {e}"
+            )
+            if attempt < retries:
+                await asyncio.sleep(wait)
+
+    logger.error(f"OpenRouter call failed after {retries} attempts: {last_error}")
     return "" if return_raw else {"error": str(last_error)}
 
 
@@ -3761,7 +3845,10 @@ async def ai_seo_agent(request: AuditRequest):
             "schema_types_found": found,
             "schema_types_missing": missing,
             "paa_questions_found": len(paa_questions),
-            **{k: soup_signals.get(k) for k in ["has_faq_schema", "has_author_bio", "has_credentials", "reviews_on_page", "has_about_page"]},
+            **{k: soup_signals.get(k) for k in [
+                "has_faq_schema", "has_author_bio", "has_credentials", "reviews_on_page", "has_about_page",
+                "faq_questions_extracted", "microdata_found", "rdfa_found", "opengraph",
+            ]},
         },
         "analysis": analysis,
         "timestamp": datetime.now().isoformat(),
@@ -3983,8 +4070,13 @@ def calculate_pillar_scores(agents: dict) -> dict:
     local_score = max(0, min(100, int(local_score)))
     gbp_score = gbp.get("analysis", {}).get("gbp_score", 30)
     gbp_score = max(0, min(100, int(gbp_score)))
-    citation_score = citation.get("plan", {}).get("citation_score", 20)
-    citation_score = max(0, min(100, int(citation_score)))
+    # Prefer real verified citation score over Claude's guess
+    verified_cs = citation.get("verified_score")
+    if verified_cs is not None:
+        citation_score = int(verified_cs)
+    else:
+        citation_score = citation.get("plan", {}).get("citation_score", 20)
+    citation_score = max(0, min(100, citation_score))
     # Reviews: derive a 0-100 score from count + rating
     # Prefer real Google Places data when available, then fall back to Claude analysis
     places = gbp.get("places_data", {})
@@ -5784,6 +5876,464 @@ Rules:
 - Do NOT include citations from the database that are clearly irrelevant to the business type"""
 
 
+# ---------------------------------------------------------------------------
+# Citation verification helpers (Crawl4AI-based real auditing)
+# ---------------------------------------------------------------------------
+
+def _normalize_phone(phone: str) -> str:
+    """Strip to digits only for comparison. '(416) 555-0100' → '4165550100'"""
+    return re.sub(r'\D', '', phone)
+
+
+def _normalize_address(addr: str) -> str:
+    """Lowercase, strip punctuation, normalize common abbreviations."""
+    addr = addr.lower().strip()
+    replacements = {
+        "street": "st", "avenue": "ave", "boulevard": "blvd",
+        "drive": "dr", "road": "rd", "suite": "ste",
+        "apartment": "apt", "north": "n", "south": "s",
+        "east": "e", "west": "w",
+    }
+    for full, abbr in replacements.items():
+        addr = addr.replace(full, abbr)
+    return re.sub(r'[^a-z0-9\s]', '', addr).strip()
+
+
+def _normalize_name(name: str) -> str:
+    """Lowercase, strip common suffixes (LLC, Inc, etc.)."""
+    name = name.lower().strip()
+    for suffix in [" llc", " inc", " ltd", " corp", " co", " pllc"]:
+        name = name.replace(suffix, "")
+    return re.sub(r'[^a-z0-9\s]', '', name).strip()
+
+
+def _score_nap_consistency(
+    expected_name: str, expected_phone: str, expected_address: str,
+    found_name: str, found_phone: str, found_address: str,
+) -> dict:
+    """Compare expected vs found NAP. Returns {name_match, phone_match, address_match, nap_score}."""
+    from difflib import SequenceMatcher
+
+    name_ratio = SequenceMatcher(None, _normalize_name(expected_name), _normalize_name(found_name)).ratio()
+    phone_match = _normalize_phone(expected_phone) == _normalize_phone(found_phone) if expected_phone and found_phone else None
+    addr_ratio = SequenceMatcher(None, _normalize_address(expected_address), _normalize_address(found_address)).ratio()
+
+    # Score: name 40%, phone 30%, address 30%
+    score = 0
+    components = 0
+    if found_name:
+        score += name_ratio * 40
+        components += 40
+    if phone_match is not None:
+        score += (100 if phone_match else 0) * 0.30
+        components += 30
+    if found_address:
+        score += addr_ratio * 30
+        components += 30
+
+    # Normalize to 0-100 based on what we could actually check
+    final = (score / components * 100) if components > 0 else 0
+
+    return {
+        "name_match": round(name_ratio, 2),
+        "phone_match": phone_match,
+        "address_match": round(addr_ratio, 2),
+        "nap_score": round(final),
+    }
+
+
+def _fuzzy_name_match(business_name: str, markdown: str) -> bool:
+    """Three-tier fuzzy match: exact normalized, token overlap, &/and normalization."""
+    md_lower = markdown.lower()
+    name_lower = business_name.lower()
+    name_norm = _normalize_name(business_name)
+
+    def _exact_in(name: str, text: str) -> bool:
+        return name in text
+
+    def _token_overlap(name: str, text: str) -> bool:
+        words = [w for w in name.split() if w != "the"]
+        if not words:
+            return False
+        text_words = set(text.split())
+        hits = sum(1 for w in words if w in text_words)
+        return hits / len(words) >= 0.70
+
+    # Tier 1: exact normalized substring
+    if _exact_in(name_norm, md_lower) or _exact_in(name_lower, md_lower):
+        return True
+    # Tier 2: token overlap
+    if _token_overlap(name_norm, md_lower):
+        return True
+    # Tier 3: &/and normalization, then repeat
+    and_variants = [(name_norm.replace(" and ", " & "), name_norm.replace(" & ", " and ")),
+                    (name_lower.replace(" and ", " & "), name_lower.replace(" & ", " and "))]
+    md_and = md_lower.replace(" & ", " and ")
+    md_amp = md_lower.replace(" and ", " & ")
+    for v1, v2 in and_variants:
+        if _exact_in(v1, md_amp) or _exact_in(v2, md_and):
+            return True
+    # Token overlap with &/and normalized
+    norm_and = name_norm.replace(" & ", " and ")
+    if _token_overlap(norm_and, md_and):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Citation cache helpers
+# ---------------------------------------------------------------------------
+
+def _citation_cache_key(business_name: str, directory_name: str) -> tuple[str, str]:
+    return (_normalize_name(business_name), directory_name.lower().strip())
+
+
+def _citation_cache_get(business_name: str, directory_name: str) -> dict | None:
+    key = _citation_cache_key(business_name, directory_name)
+    entry = _citation_cache.get(key)
+    if entry and (time.time() - entry["ts"]) < _CITATION_CACHE_TTL:
+        return entry["result"]
+    if entry:
+        _citation_cache.pop(key, None)
+    return None
+
+
+def _citation_cache_set(business_name: str, directory_name: str, result: dict) -> None:
+    # Only cache found / not_found — never scrape_failed (transient)
+    if result.get("status") in ("found", "not_found"):
+        key = _citation_cache_key(business_name, directory_name)
+        _citation_cache[key] = {"result": result, "ts": time.time()}
+
+
+# ---------------------------------------------------------------------------
+# Batch scraping — one browser for all URLs, with automatic retry
+# ---------------------------------------------------------------------------
+
+_BATCH_CRAWL_SCRIPT = '''
+import asyncio, json, sys, logging
+logging.disable(logging.CRITICAL)
+
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+
+async def main():
+    tasks = json.loads(sys.stdin.read())
+    results = []
+    async with AsyncWebCrawler(verbose=False) as crawler:
+        # First pass
+        for t in tasks:
+            url = t["url"]
+            timeout_ms = t.get("timeout_ms", 20000)
+            config = CrawlerRunConfig(
+                word_count_threshold=10,
+                page_timeout=timeout_ms,
+                verbose=False,
+            )
+            try:
+                r = await crawler.arun(url=url, config=config)
+                results.append({
+                    "url": url,
+                    "success": r.success,
+                    "markdown": r.markdown[:8000] if r.markdown else "",
+                    "status_code": getattr(r, "status_code", 0),
+                })
+            except Exception:
+                results.append({"url": url, "success": False, "markdown": "", "status_code": 0})
+
+        # Retry pass: only status_code == 0 (timeout/exception), not 4xx/5xx
+        for i, res in enumerate(results):
+            if res["status_code"] == 0 and not res["success"]:
+                url = res["url"]
+                orig_timeout = next((t.get("timeout_ms", 20000) for t in tasks if t["url"] == url), 20000)
+                config = CrawlerRunConfig(
+                    word_count_threshold=10,
+                    page_timeout=orig_timeout + 10000,
+                    verbose=False,
+                )
+                try:
+                    r = await crawler.arun(url=url, config=config)
+                    results[i] = {
+                        "url": url,
+                        "success": r.success,
+                        "markdown": r.markdown[:8000] if r.markdown else "",
+                        "status_code": getattr(r, "status_code", 0),
+                    }
+                except Exception:
+                    pass  # keep original failure
+
+    print("__CRAWL4AI_JSON__" + json.dumps(results))
+
+asyncio.run(main())
+'''
+
+
+async def _scrape_citations_batch(
+    urls: list[str], timeout_per_url: int = 20, total_timeout: int = 300
+) -> dict[str, dict | None]:
+    """Scrape all URLs in one subprocess with one browser. Returns URL -> result dict."""
+    if not urls:
+        return {}
+    tasks_payload = [{"url": u, "timeout_ms": timeout_per_url * 1000} for u in urls]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", _BATCH_CRAWL_SCRIPT,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(input=json.dumps(tasks_payload).encode()),
+            timeout=total_timeout,
+        )
+        output = stdout.decode()
+        marker = "__CRAWL4AI_JSON__"
+        idx = output.find(marker)
+        if idx < 0:
+            logger.debug("Batch crawl: no JSON marker in output")
+            return {u: None for u in urls}
+        raw = json.loads(output[idx + len(marker):].strip())
+        return {r["url"]: r for r in raw}
+    except Exception as e:
+        logger.debug(f"Batch crawl failed: {e}")
+        return {u: None for u in urls}
+
+
+def _extract_nap_regex(markdown: str, business_name: str) -> dict:
+    """Extract NAP from directory listing text using regex patterns."""
+    lower = markdown.lower()
+    biz_lower = business_name.lower()
+
+    # Get ~2000 chars around the business name mention
+    idx = lower.find(biz_lower)
+    if idx >= 0:
+        start = max(0, idx - 500)
+        end = min(len(markdown), idx + 1500)
+        snippet = markdown[start:end]
+    else:
+        snippet = markdown[:2000]
+
+    # --- Extract phone ---
+    # Match common North American formats: (416) 555-0100, 416-555-0100,
+    # 416.555.0100, +1 416 555 0100, 1-800-555-0100
+    phone_patterns = [
+        r'\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}',
+        r'\d{3}[\s.-]\d{3}[\s.-]\d{4}',
+    ]
+    found_phone = ""
+    for pat in phone_patterns:
+        m = re.search(pat, snippet)
+        if m:
+            found_phone = m.group(0).strip()
+            break
+
+    # --- Extract address ---
+    # All patterns require a street-type word to avoid matching random numbers.
+    _street_types = (
+        r'(?:st(?:reet)?|ave(?:nue)?|blvd|boulevard|dr(?:ive)?|rd|road|way|'
+        r'lane|ln|ct|court|pl(?:ace)?|cres(?:cent)?|pkwy|parkway|'
+        r'terr(?:ace)?|cir(?:cle)?|hwy|highway|trail|tr)'
+    )
+    addr_patterns = [
+        # Full: 123 Main St, Toronto, ON M5V 1A1  or  123 Main St, Toronto, ON 90210
+        r'\d{1,5}\s+[\w\s.]{2,40}' + _street_types + r'[\w\s.,#-]*(?:[A-Z]{2}\s+\w{3}\s*\w{3}|\d{5}(?:-\d{4})?)',
+        # Medium: 123 Main St, Toronto, ON
+        r'\d{1,5}\s+[\w\s.]{2,40}' + _street_types + r'[.,\s]+[\w\s]{2,30}[.,\s]+[A-Z]{2}\b',
+        # Minimal: 123 Main St, City
+        r'\d{1,5}\s+[\w\s.]{2,40}' + _street_types + r'[.,\s]+[\w\s]{2,30}',
+    ]
+    found_address = ""
+    biz_name_words = set(biz_lower.split())
+    for pat in addr_patterns:
+        m = re.search(pat, snippet, re.IGNORECASE)
+        if m:
+            addr = m.group(0).strip().rstrip(",. ")
+            # Reject if address contains the business name (likely a heading, not an address)
+            addr_words = set(addr.lower().split())
+            if len(biz_name_words & addr_words) >= len(biz_name_words) * 0.5:
+                continue
+            # Sanity: address should be 10-150 chars
+            if 10 <= len(addr) <= 150:
+                found_address = addr
+                break
+
+    # --- Extract business name as shown ---
+    # Find the closest case-preserved match to the business name
+    found_name = ""
+    # Try exact case-insensitive match first
+    name_match = re.search(re.escape(business_name), snippet, re.IGNORECASE)
+    if name_match:
+        found_name = name_match.group(0)
+    else:
+        # Try finding a line that contains most of the business name words
+        biz_words = set(biz_lower.split())
+        best_score = 0
+        for line in snippet.split("\n"):
+            line_lower = line.lower().strip()
+            if not line_lower or len(line_lower) > 200:
+                continue
+            line_words = set(line_lower.split())
+            overlap = len(biz_words & line_words)
+            if overlap > best_score and overlap >= len(biz_words) * 0.6:
+                best_score = overlap
+                found_name = line.strip()[:100]
+
+    return {"name": found_name, "phone": found_phone, "address": found_address}
+
+
+async def _extract_nap_from_markdown(markdown: str, business_name: str) -> dict:
+    """Extract NAP using regex (primary) with Claude as optional fallback."""
+    result = _extract_nap_regex(markdown, business_name)
+
+    # If regex found a name, return it — good enough
+    if result.get("name"):
+        return result
+
+    # Fallback to Claude only if regex found nothing and API is available
+    try:
+        lower = markdown.lower()
+        idx = lower.find(business_name.lower())
+        if idx >= 0:
+            start = max(0, idx - 500)
+            end = min(len(markdown), idx + 1500)
+            snippet = markdown[start:end]
+        else:
+            snippet = markdown[:2000]
+
+        prompt = (
+            f'Extract the business NAP (Name, Address, Phone) for "{business_name}" '
+            f'from this directory listing text. Return JSON only:\n'
+            f'{{"name": "exact business name shown", "phone": "phone number or empty", '
+            f'"address": "full address or empty"}}\n\nText:\n{snippet}'
+        )
+        claude_result = await call_claude(
+            "You extract structured NAP data from directory listing text. Return JSON only.",
+            prompt,
+            max_tokens=200,
+        )
+        if isinstance(claude_result, dict) and claude_result.get("name"):
+            return claude_result
+    except Exception:
+        pass  # Claude unavailable — regex result is fine
+
+    return result
+
+
+async def _verify_citations(
+    business_name: str,
+    location: str,
+    expected_phone: str,
+    expected_address: str,
+    directories: list[dict],
+    max_concurrent: int = 5,
+) -> list[dict]:
+    """Scrape directories and verify business listings + NAP consistency.
+
+    Uses batch scraping (one browser), fuzzy name matching, in-memory cache,
+    and automatic retry of transient failures.
+    """
+    from urllib.parse import quote_plus
+
+    results: list[dict] = []
+    cached_results: list[dict] = []
+    to_scrape: list[dict] = []  # directories needing a live scrape
+    url_to_directory: dict[str, dict] = {}
+
+    # 1. Partition: cached hits vs needs-scraping
+    for directory in directories:
+        template = directory.get("search_url_template", "")
+        if not template:
+            results.append({**directory, "status": "unable_to_verify", "nap": None})
+            continue
+
+        cached = _citation_cache_get(business_name, directory.get("name", ""))
+        if cached is not None:
+            cached_results.append(cached)
+            continue
+
+        search_url = template.replace(
+            "{business_name}", quote_plus(business_name)
+        ).replace("{location}", quote_plus(location))
+        url_to_directory[search_url] = directory
+        to_scrape.append(directory)
+
+    # 2. Batch scrape all uncached URLs in one subprocess
+    if url_to_directory:
+        scrape_results = await _scrape_citations_batch(
+            list(url_to_directory.keys()),
+            timeout_per_url=20,
+            total_timeout=300,
+        )
+    else:
+        scrape_results = {}
+
+    # 3. Process results: fuzzy match → NAP extraction → scoring → cache
+    async def _process_one(search_url: str, directory: dict) -> dict:
+        page = scrape_results.get(search_url)
+        if not page or not page.get("success"):
+            return {**directory, "status": "scrape_failed", "nap": None}
+
+        raw_markdown = page.get("markdown", "")
+
+        # Fuzzy name matching (replaces strict substring check)
+        if not _fuzzy_name_match(business_name, raw_markdown):
+            result = {**directory, "status": "not_found", "nap": None}
+            _citation_cache_set(business_name, directory.get("name", ""), result)
+            return result
+
+        # Business found — extract NAP
+        nap_extract = await _extract_nap_from_markdown(raw_markdown, business_name)
+
+        nap_score = _score_nap_consistency(
+            business_name, expected_phone, expected_address,
+            nap_extract.get("name", ""),
+            nap_extract.get("phone", ""),
+            nap_extract.get("address", ""),
+        )
+
+        result = {
+            **directory,
+            "status": "found",
+            "found_nap": nap_extract,
+            "nap": nap_score,
+        }
+        _citation_cache_set(business_name, directory.get("name", ""), result)
+        return result
+
+    scraped_tasks = [
+        _process_one(url, directory)
+        for url, directory in url_to_directory.items()
+    ]
+    scraped_results = await asyncio.gather(*scraped_tasks, return_exceptions=True)
+
+    return (
+        results
+        + cached_results
+        + [r for r in scraped_results if isinstance(r, dict)]
+    )
+
+
+def _calculate_real_citation_score(verification_results: list[dict]) -> int:
+    """Calculate citation score from real verification data."""
+    if not verification_results:
+        return 20  # fallback
+
+    found = [r for r in verification_results if r.get("status") == "found"]
+    checkable = [r for r in verification_results if r.get("status") != "unable_to_verify"]
+
+    if not checkable:
+        return 20
+
+    # Presence score (0-60): % of checkable directories where listing was found
+    presence = len(found) / len(checkable)
+    presence_score = presence * 60
+
+    # NAP consistency score (0-40): average NAP score across found listings
+    nap_scores = [r["nap"]["nap_score"] for r in found if r.get("nap")]
+    avg_nap = sum(nap_scores) / len(nap_scores) if nap_scores else 0
+    nap_score = (avg_nap / 100) * 40
+
+    return max(0, min(100, round(presence_score + nap_score)))
+
+
 @app.post("/agents/citation-builder")
 async def citation_builder_agent(request: AuditRequest):
     """Citation Builder — loads citations.json, filters by business type/region, generates NAP template."""
@@ -5817,6 +6367,30 @@ async def citation_builder_agent(request: AuditRequest):
 
     filtered = [c for c in all_citations if _matches(c)]
 
+    # --- Real citation verification with Crawl4AI ---
+    verification_results = []
+    real_citation_score = None
+    try:
+        # Use top ~20 directories (by tier + DA) to keep scraping fast
+        top_dirs = sorted(filtered, key=lambda x: (-x.get("tier", 3), -x.get("da", 0)))[:20]
+
+        # Pull phone/address from request or profile NAP data
+        expected_phone = request.phone or ""
+        expected_address = request.address or ""
+
+        verification_results = await _verify_citations(
+            business_name=biz_name,
+            location=request.location,
+            expected_phone=expected_phone,
+            expected_address=expected_address,
+            directories=top_dirs,
+            max_concurrent=5,
+        )
+        real_citation_score = _calculate_real_citation_score(verification_results)
+        logger.info(f"[{audit_id}] Citation verification done: {len(verification_results)} checked, score={real_citation_score}")
+    except Exception as e:
+        logger.warning(f"[{audit_id}] Citation verification failed, falling back to Claude: {e}")
+
     # Build compact citation list for the prompt
     citation_lines = []
     for c in sorted(filtered, key=lambda x: (-x.get("tier", 3), -x.get("da", 0))):
@@ -5825,6 +6399,18 @@ async def citation_builder_agent(request: AuditRequest):
             f"[Tier {c.get('tier',3)} | DA:{c.get('da',0)} | {free_label}] "
             f"{c['name']} — submit: {c.get('submit_url', c['url'])}"
         )
+
+    # Build verification context for Claude prompt
+    verification_context = ""
+    if verification_results:
+        verified_lines = []
+        for r in verification_results:
+            status = r.get("status", "unknown")
+            nap_info = ""
+            if r.get("nap"):
+                nap_info = f" | NAP: name={r['nap']['name_match']}, phone={r['nap']['phone_match']}, addr={r['nap']['address_match']}"
+            verified_lines.append(f"  {r['name']}: {status}{nap_info}")
+        verification_context = "\n\nVERIFIED CITATION STATUS (from real scraping):\n" + "\n".join(verified_lines)
 
     prompt = CITATION_PROMPT.format(
         business_name=biz_name,
@@ -5835,9 +6421,17 @@ async def citation_builder_agent(request: AuditRequest):
         region=region.upper(),
         total_citations=len(filtered),
         citation_list="\n".join(citation_lines),
-    )
+    ) + verification_context
+
+    # If we have real data, instruct Claude to use verified score
+    if real_citation_score is not None:
+        prompt += f"\n\nIMPORTANT: Use citation_score={real_citation_score} (verified by scraping). Update listing statuses based on the VERIFIED data above (found → 'listed', not_found → 'missing', scrape_failed → 'likely_missing')."
 
     plan = await call_claude(CITATION_SYSTEM, prompt, max_tokens=4000)
+
+    # Override Claude's score with real score if available
+    if real_citation_score is not None and isinstance(plan, dict):
+        plan["citation_score"] = real_citation_score
 
     return {
         "agent": "citation_builder",
@@ -5847,6 +6441,8 @@ async def citation_builder_agent(request: AuditRequest):
         "target_url": request.target_url,
         "region": region,
         "citations_in_database": len(filtered),
+        "verification": verification_results,
+        "verified_score": real_citation_score,
         "plan": plan,
         "timestamp": datetime.now().isoformat(),
     }
@@ -5969,6 +6565,16 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
                     if profile.country:
                         loc_parts.append(profile.country)
                     request.location = ", ".join(loc_parts)
+                # Pull phone/address from profile NAP data for citation verification
+                if profile.nap_data:
+                    try:
+                        nap = json.loads(profile.nap_data)
+                        if not request.phone and nap.get("phone"):
+                            request.phone = nap["phone"]
+                        if not request.address and nap.get("address"):
+                            request.address = nap["address"]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                 # Compute next version number
                 from sqlalchemy import func
                 max_ver = db.query(func.max(Audit.version)).filter(
@@ -6034,7 +6640,7 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
         if current_user:
             db = SessionLocal()
             try:
-                user_obj = db.query(User).filter(User.id == current_user["user_id"]).first()
+                user_obj = db.query(User).filter(User.id == current_user.id).first()
                 if user_obj and getattr(user_obj, "google_access_token", None):
                     gsc_token = user_obj.google_access_token
             finally:
@@ -7376,7 +7982,7 @@ async def keyword_gap_analysis(
     prompt = (
         f"Compare this competitor website against a {business_type} "
         f"{'in ' + location if location else ''} "
-        f"{'targeting \"' + keyword + '\"' if keyword else ''}.\n\n"
+        f"{'targeting ' + chr(34) + keyword + chr(34) if keyword else ''}.\n\n"
         f"COMPETITOR PAGE DATA:\n"
         f"- URL: {competitor_url}\n"
         f"- Title: {comp_data.get('title', 'N/A')}\n"
@@ -7617,6 +8223,7 @@ async def health():
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
         "api_key_set": bool(ANTHROPIC_API_KEY),
+        "openrouter_key_set": bool(OPENROUTER_API_KEY),
         "serpapi_key_set": bool(SERPAPI_KEY),
     }
 
