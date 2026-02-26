@@ -58,14 +58,13 @@ MOZ_ACCESS_ID = os.getenv("MOZ_ACCESS_ID", "")
 MOZ_SECRET_KEY = os.getenv("MOZ_SECRET_KEY", "")
 MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "50"))
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL_FAST = os.getenv("OPENROUTER_MODEL_FAST", "google/gemini-2.0-flash-001")
-OPENROUTER_MODEL_SMART = os.getenv("OPENROUTER_MODEL_SMART", "google/gemini-2.0-flash-001")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-if not ANTHROPIC_API_KEY and not OPENROUTER_API_KEY:
-    logger.warning("⚠️  Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY is set — all AI calls will fail")
+if not ANTHROPIC_API_KEY and not DEEPSEEK_API_KEY:
+    logger.warning("⚠️  Neither ANTHROPIC_API_KEY nor DEEPSEEK_API_KEY is set — all AI calls will fail")
 elif not ANTHROPIC_API_KEY:
-    logger.warning("⚠️  ANTHROPIC_API_KEY is not set — using OpenRouter as primary")
+    logger.warning("⚠️  ANTHROPIC_API_KEY is not set — using DeepSeek as primary")
 if not SERPAPI_KEY:
     logger.warning("⚠️  SERPAPI_KEY is not set — competitor research will fail")
 if not JWT_SECRET:
@@ -1976,9 +1975,9 @@ async def call_claude(
             is_billing = "credit balance" in err_str.lower() or "billing" in err_str.lower()
             if is_billing:
                 logger.error(f"Claude billing error (not retrying): {e}")
-                if OPENROUTER_API_KEY:
-                    logger.info("Falling back to OpenRouter...")
-                    return await _call_openrouter(system, prompt, max_tokens, retries=2, return_raw=return_raw, model=use_model)
+                if DEEPSEEK_API_KEY:
+                    logger.info("Falling back to DeepSeek...")
+                    return await _call_deepseek(system, prompt, max_tokens, retries=2, return_raw=return_raw)
                 break
             is_rate_limit = "rate_limit" in err_str.lower() or "429" in err_str
             wait = 30 if is_rate_limit else 2 * attempt
@@ -1994,35 +1993,28 @@ async def call_claude(
 
 
 # ---------------------------------------------------------------------------
-# OpenRouter fallback helper
+# DeepSeek fallback helper
 # ---------------------------------------------------------------------------
 
-async def _call_openrouter(
+async def _call_deepseek(
     system: str,
     prompt: str,
     max_tokens: int = 2000,
     retries: int = 2,
     return_raw: bool = False,
-    model: str | None = None,
 ) -> dict | str:
     """
-    Call OpenRouter as a fallback when Claude billing fails.
+    Call DeepSeek as a fallback when Claude billing fails.
     Same interface as call_claude() so callers are unaffected.
     """
     import httpx
 
-    # Map Claude model choice to the corresponding OpenRouter model
-    if model == CLAUDE_MODEL_SMART:
-        or_model = OPENROUTER_MODEL_SMART
-    else:
-        or_model = OPENROUTER_MODEL_FAST
-
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": or_model,
+        "model": DEEPSEEK_MODEL,
         "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system},
@@ -2035,7 +2027,7 @@ async def _call_openrouter(
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
+                    "https://api.deepseek.com/chat/completions",
                     headers=headers,
                     json=payload,
                 )
@@ -2043,7 +2035,7 @@ async def _call_openrouter(
                 data = resp.json()
 
             raw = data["choices"][0]["message"]["content"]
-            logger.info(f"OpenRouter ({or_model}) returned {len(raw)} chars")
+            logger.info(f"DeepSeek ({DEEPSEEK_MODEL}) returned {len(raw)} chars")
             if return_raw:
                 return raw
             return extract_json(raw)
@@ -2052,12 +2044,12 @@ async def _call_openrouter(
             last_error = e
             wait = 2 * attempt
             logger.warning(
-                f"OpenRouter call attempt {attempt}/{retries} failed (retrying in {wait} s): {e}"
+                f"DeepSeek call attempt {attempt}/{retries} failed (retrying in {wait} s): {e}"
             )
             if attempt < retries:
                 await asyncio.sleep(wait)
 
-    logger.error(f"OpenRouter call failed after {retries} attempts: {last_error}")
+    logger.error(f"DeepSeek call failed after {retries} attempts: {last_error}")
     return "" if return_raw else {"error": str(last_error)}
 
 
@@ -8223,7 +8215,7 @@ async def health():
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
         "api_key_set": bool(ANTHROPIC_API_KEY),
-        "openrouter_key_set": bool(OPENROUTER_API_KEY),
+        "deepseek_key_set": bool(DEEPSEEK_API_KEY),
         "serpapi_key_set": bool(SERPAPI_KEY),
     }
 
