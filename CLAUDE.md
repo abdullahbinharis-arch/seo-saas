@@ -10,7 +10,7 @@ A FastAPI backend with 4 AI agents (Keyword Research, On-Page SEO, Local SEO, Te
 
 - **Backend:** Python 3.10+, FastAPI, AsyncAnthropic, httpx, BeautifulSoup4, fpdf2
 - **Frontend:** Next.js 14+ (App Router), TypeScript, Tailwind CSS v4, Outfit + Geist fonts
-- **AI:** Claude API via `anthropic` SDK (async client only) — model: `claude-sonnet-4-6`
+- **AI:** Claude API via `anthropic` SDK (async client only) — two-tier model: `claude-sonnet-4-6` (analysis) + `claude-opus-4-6` (content writing)
 - **Auth:** JWT (python-jose) + bcrypt passwords + Google OAuth (synced via FastAPI)
 - **Data:** SerpApi for Google results, httpx for scraping
 - **Email:** Resend (`resend` package) — triggered after audit completes
@@ -42,10 +42,10 @@ NextAuth.js on frontend stores JWT in session, sends as Authorization: Bearer <t
 ## Key Rules
 
 1. **Always use AsyncAnthropic** — never the sync client. All Claude calls must be `await`ed.
-2. **All Claude calls go through `call_claude()`** — the centralised helper in main.py. Never call `anthropic_client.messages.create()` directly from endpoints.
+2. **All Claude calls go through `call_claude()`** — the centralised helper in main.py. Never call `anthropic_client.messages.create()` directly from endpoints. Pass `model=CLAUDE_MODEL_SMART` for content writing / complex reasoning tasks; analysis agents use the default (`CLAUDE_MODEL_FAST`).
 3. **JSON extraction uses `extract_json()`** — never raw regex. This handles markdown fences, preamble text, and unbalanced braces.
 4. **System prompts are separate constants** — defined at module level (e.g., `KEYWORD_SYSTEM`), not inline in functions.
-5. **No assistant prefill** — `claude-sonnet-4-6` does not support it. Force JSON via the system prompt wording ("respond with valid JSON only") and `extract_json()` handles parsing.
+5. **No assistant prefill** — `claude-opus-4-6` does not support it. Force JSON via the system prompt wording ("respond with valid JSON only") and `extract_json()` handles parsing.
 6. **Environment variables load via python-dotenv** — `load_dotenv()` is called at startup.
 7. **Error messages to users are generic** — never expose stack traces, API keys, or internal details in HTTP responses.
 8. **Rate limiting is enabled** — in-memory, configurable via `RATE_LIMIT_PER_MIN`.
@@ -96,7 +96,8 @@ SERPAPI_KEY=
 JWT_SECRET=              # 32+ char random hex — must match NEXTAUTH_SECRET on frontend
 ALLOWED_ORIGINS=         # Comma-separated: https://yourdomain.vercel.app,...
 DATABASE_URL=            # PostgreSQL (Railway provides this automatically)
-CLAUDE_MODEL=claude-sonnet-4-6
+CLAUDE_MODEL_FAST=claude-sonnet-4-6   # analysis & extraction agents
+CLAUDE_MODEL_SMART=claude-opus-4-6   # content writing & complex reasoning
 RESEND_API_KEY=          # Optional — email skipped if not set
 FROM_EMAIL=              # e.g. LocalRankr <noreply@localrankr.io>
 RATE_LIMIT_PER_MIN=10
@@ -116,7 +117,7 @@ GOOGLE_CLIENT_SECRET=
 ### Add a new agent
 1. Define `NEWAGENT_SYSTEM` and `NEWAGENT_PROMPT` constants at module level
 2. Create `async def newagent(request: AuditRequest)` following existing agent pattern
-3. Call `call_claude(NEWAGENT_SYSTEM, prompt, max_tokens=N)`
+3. Call `call_claude(NEWAGENT_SYSTEM, prompt, max_tokens=N)` — add `model=CLAUDE_MODEL_SMART` if the agent writes content
 4. Add to `seo_audit_workflow` inside `asyncio.gather()`
 5. Update `build_quick_wins()` to pull from new agent's output
 
@@ -165,7 +166,8 @@ curl -X POST http://localhost:8000/workflow/seo-audit \
 ## Dependencies
 
 - `anthropic>=0.39.0` — AsyncAnthropic + current model names
-- `claude-sonnet-4-6` — correct model ID (not `claude-sonnet-4-20250514`)
+- `claude-sonnet-4-6` — fast model for analysis agents (CLAUDE_MODEL_FAST)
+- `claude-opus-4-6` — smart model for content writing (CLAUDE_MODEL_SMART)
 - `fpdf2>=2.7.9` — PDF generation (not reportlab)
 - `resend>=2.0.0` — transactional email
 

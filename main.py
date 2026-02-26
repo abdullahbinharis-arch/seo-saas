@@ -46,7 +46,8 @@ logger = logging.getLogger("seo-saas")
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+CLAUDE_MODEL_FAST = os.getenv("CLAUDE_MODEL_FAST", "claude-sonnet-4-6")   # analysis & extraction
+CLAUDE_MODEL_SMART = os.getenv("CLAUDE_MODEL_SMART", "claude-opus-4-6")  # content writing & complex reasoning
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
@@ -1715,18 +1716,21 @@ async def call_claude(
     max_tokens: int = 2000,
     retries: int = 3,
     return_raw: bool = False,
+    model: str | None = None,
 ) -> dict | str:
     """
     Call Claude with a system prompt and user prompt.
     Retries on transient failures with backoff.
     On rate-limit (429) errors, waits 30 s before retrying.
     Returns parsed JSON dict by default, or raw text string if return_raw=True.
+    Pass model=CLAUDE_MODEL_SMART for content writing / complex reasoning tasks.
     """
+    use_model = model or CLAUDE_MODEL_FAST
     last_error = None
     for attempt in range(1, retries + 1):
         try:
             response = await anthropic_client.messages.create(
-                model=CLAUDE_MODEL,
+                model=use_model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=[
@@ -2749,7 +2753,8 @@ async def content_rewriter_agent(request: AuditRequest):
     )
 
     rewritten_content = await call_claude(
-        REWRITER_SYSTEM, content_prompt, max_tokens=4000, return_raw=True
+        REWRITER_SYSTEM, content_prompt, max_tokens=4000, return_raw=True,
+        model=CLAUDE_MODEL_SMART,
     )
 
     word_count = len(rewritten_content.split()) if rewritten_content else 0
@@ -3418,7 +3423,7 @@ async def ai_seo_agent(request: AuditRequest):
         competitor_data=competitor_data,
     )
 
-    analysis = await call_claude(AISEO_SYSTEM, prompt, max_tokens=4000)
+    analysis = await call_claude(AISEO_SYSTEM, prompt, max_tokens=4000, model=CLAUDE_MODEL_SMART)
 
     return {
         "agent": "ai_seo",
@@ -3568,7 +3573,8 @@ async def blog_writer_agent(request: AuditRequest):
         featured_snippet=featured_snippet,
     )
     blog_content = await call_claude(
-        BLOG_SYSTEM, write_prompt, max_tokens=4000, return_raw=True
+        BLOG_SYSTEM, write_prompt, max_tokens=4000, return_raw=True,
+        model=CLAUDE_MODEL_SMART,
     )
 
     word_count = len(blog_content.split()) if blog_content else 0
@@ -6547,7 +6553,7 @@ async def generate_blog(
         f"- Maintain 1-2% keyword density for \"{kw}\""
     )
 
-    result = await call_claude(BLOG_GENERATE_SYSTEM, prompt, max_tokens=4000)
+    result = await call_claude(BLOG_GENERATE_SYSTEM, prompt, max_tokens=4000, model=CLAUDE_MODEL_SMART)
     if isinstance(result, dict):
         result.setdefault("topic", topic)
         return result
@@ -6609,7 +6615,7 @@ async def generate_social_post(
         f"}}"
     )
 
-    result = await call_claude(SOCIAL_GENERATE_SYSTEM, prompt, max_tokens=2000)
+    result = await call_claude(SOCIAL_GENERATE_SYSTEM, prompt, max_tokens=2000, model=CLAUDE_MODEL_SMART)
     if isinstance(result, dict):
         result.setdefault("platform", platform)
         return result
@@ -6645,7 +6651,7 @@ async def generate_social_all(
         f'}}'
     )
 
-    result = await call_claude(SOCIAL_GENERATE_SYSTEM, prompt, max_tokens=3000)
+    result = await call_claude(SOCIAL_GENERATE_SYSTEM, prompt, max_tokens=3000, model=CLAUDE_MODEL_SMART)
     if isinstance(result, dict):
         return result
     return {"error": "Could not generate content"}
@@ -6693,7 +6699,7 @@ async def generate_guest_post(
         f"- Include \"{kw}\" naturally 2-3 times"
     )
 
-    result = await call_claude(GUEST_POST_SYSTEM, prompt, max_tokens=3000)
+    result = await call_claude(GUEST_POST_SYSTEM, prompt, max_tokens=3000, model=CLAUDE_MODEL_SMART)
     if isinstance(result, dict):
         result.setdefault("platform", platform)
         return result
@@ -6846,7 +6852,7 @@ async def generate_content(
     if request.context:
         prompt += f"Additional context: {request.context}\n"
     prompt += "Write comprehensive, SEO-optimized content."
-    result = await call_claude(CONTENT_GENERATE_SYSTEM, prompt, max_tokens=3000)
+    result = await call_claude(CONTENT_GENERATE_SYSTEM, prompt, max_tokens=3000, model=CLAUDE_MODEL_SMART)
     return result if isinstance(result, dict) else {"content": str(result)}
 
 
@@ -7129,7 +7135,7 @@ async def outrank_competitor(
         f"- Suggest 3-5 internal links"
     )
 
-    result = await call_claude(OUTRANK_SYSTEM, prompt, max_tokens=4000)
+    result = await call_claude(OUTRANK_SYSTEM, prompt, max_tokens=4000, model=CLAUDE_MODEL_SMART)
 
     if isinstance(result, dict) and "error" not in result:
         result.setdefault("competitor_analysis", {
@@ -7181,7 +7187,8 @@ async def info():
     return {
         "name": "SEO SaaS API",
         "version": "1.0.0",
-        "model": CLAUDE_MODEL,
+        "model_fast": CLAUDE_MODEL_FAST,
+        "model_smart": CLAUDE_MODEL_SMART,
         "agents": ["keyword_research", "on_page_seo", "local_seo"],
         "endpoints": {
             "keyword_research": "POST /agents/keyword-research",
