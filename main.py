@@ -3652,14 +3652,31 @@ def calculate_pillar_scores(agents: dict) -> dict:
         backlinks_score = 75 + int(((da_val - 60) / 40) * 25)  # 60-100 DA → 75-100
     backlinks_score = max(0, min(100, backlinks_score))
 
-    # Local SEO: local_seo 40% + gbp 35% + citation 25%
+    # Local SEO: gbp 45% + reviews 25% + local base 15% + citations 15%
     local_score = local.get("recommendations", {}).get("local_seo_score", 35)
     local_score = max(0, min(100, int(local_score)))
     gbp_score = gbp.get("analysis", {}).get("gbp_score", 30)
     gbp_score = max(0, min(100, int(gbp_score)))
     citation_score = citation.get("plan", {}).get("citation_score", 20)
     citation_score = max(0, min(100, int(citation_score)))
-    local_seo = max(0, min(100, int(local_score * 0.40 + gbp_score * 0.35 + citation_score * 0.25)))
+    # Reviews: derive a 0-100 score from count + rating
+    review_count_raw = gbp.get("analysis", {}).get("review_count", 0)
+    if not review_count_raw:
+        review_count_raw = gbp.get("analysis", {}).get("map_pack_status", {}).get("reviews", 0)
+    review_count_val = int(review_count_raw) if review_count_raw else 0
+    avg_rating_raw = gbp.get("analysis", {}).get("avg_rating", 0)
+    if not avg_rating_raw:
+        avg_rating_raw = gbp.get("analysis", {}).get("map_pack_status", {}).get("rating", 0)
+    avg_rating_val = float(avg_rating_raw) if avg_rating_raw else 0.0
+    # Count component (0-60): 50+ reviews = full marks, scaled linearly
+    review_count_component = min(60, int((min(review_count_val, 50) / 50) * 60))
+    # Rating component (0-40): 5.0 = full marks, below 3.0 = 0
+    rating_clamped = max(0.0, min(5.0, avg_rating_val))
+    review_rating_component = int(max(0, ((rating_clamped - 3.0) / 2.0) * 40)) if rating_clamped >= 3.0 else 0
+    review_score = max(0, min(100, review_count_component + review_rating_component))
+    local_seo = max(0, min(100, int(
+        gbp_score * 0.45 + review_score * 0.25 + local_score * 0.15 + citation_score * 0.15
+    )))
 
     # AI SEO: use agent score if present, else calculate from signals
     ai_visibility = ai_seo.get("analysis", {}).get("ai_visibility_score", 0)
@@ -3669,9 +3686,9 @@ def calculate_pillar_scores(agents: dict) -> dict:
         signals = ai_seo.get("signals_collected", {})
         ai_seo_score = calculate_ai_seo_score_from_signals(signals)
 
-    # Overall: website 30% + local 30% + backlinks 20% + ai 20%
+    # Overall: local 40% + website 25% + ai 20% + backlinks 15%
     overall = max(0, min(100, int(
-        website_seo * 0.30 + local_seo * 0.30 + backlinks_score * 0.20 + ai_seo_score * 0.20
+        local_seo * 0.40 + website_seo * 0.25 + ai_seo_score * 0.20 + backlinks_score * 0.15
     )))
 
     return {
@@ -3680,6 +3697,7 @@ def calculate_pillar_scores(agents: dict) -> dict:
         "backlinks": backlinks_score,
         "local_seo": local_seo,
         "ai_seo": ai_seo_score,
+        "reviews": review_score,
     }
 
 
@@ -3773,6 +3791,7 @@ def build_score_details(agents: dict) -> dict:
             "citations_found": int(citations_found),
             "citations_needed": citations_needed,
             "review_count": int(review_count),
+            "review_score": "included in local_seo pillar at 25% weight",
         },
         "ai_seo": {
             "faq_schema": has_faq,
