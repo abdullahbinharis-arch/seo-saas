@@ -46,11 +46,13 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
 
-    id               = Column(String(36), primary_key=True)
-    email            = Column(String(255), nullable=False, unique=True, index=True)
-    hashed_password  = Column(String, nullable=True)   # null for Google-only accounts
-    google_sub       = Column(String(255), nullable=True, index=True)
-    created_at       = Column(DateTime, default=datetime.utcnow)
+    id                    = Column(String(36), primary_key=True)
+    email                 = Column(String(255), nullable=False, unique=True, index=True)
+    hashed_password       = Column(String, nullable=True)   # null for Google-only accounts
+    google_sub            = Column(String(255), nullable=True, index=True)
+    google_access_token   = Column(Text, nullable=True)     # for GSC API access
+    google_refresh_token  = Column(Text, nullable=True)     # for token refresh
+    created_at            = Column(DateTime, default=datetime.utcnow)
 
 
 class Profile(Base):
@@ -98,8 +100,9 @@ class Audit(Base):
 # ---------------------------------------------------------------------------
 
 def _migrate_schema() -> None:
-    """Add new columns to existing audits table. Safe to run repeatedly."""
-    new_columns = [
+    """Add new columns to existing tables. Safe to run repeatedly."""
+    # Audits table migrations
+    audit_columns = [
         ("profile_id",    "VARCHAR(36)"),
         ("version",       "INTEGER"),
         ("business_name", "VARCHAR(255)"),
@@ -107,14 +110,27 @@ def _migrate_schema() -> None:
         ("pages_crawled", "INTEGER"),
     ]
     with engine.connect() as conn:
-        for col_name, col_type in new_columns:
+        for col_name, col_type in audit_columns:
             try:
                 conn.execute(text(f"ALTER TABLE audits ADD COLUMN {col_name} {col_type}"))
                 conn.commit()
                 logger.info(f"Migration: added audits.{col_name}")
             except Exception:
                 conn.rollback()
-                # Column already exists — expected on subsequent startups
+
+    # Users table migrations — Google tokens for GSC
+    user_columns = [
+        ("google_access_token",  "TEXT"),
+        ("google_refresh_token", "TEXT"),
+    ]
+    with engine.connect() as conn:
+        for col_name, col_type in user_columns:
+            try:
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}"))
+                conn.commit()
+                logger.info(f"Migration: added users.{col_name}")
+            except Exception:
+                conn.rollback()
 
 
 def _backfill_profiles() -> None:

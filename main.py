@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from collections import defaultdict
@@ -56,6 +57,7 @@ FROM_EMAIL = os.getenv("FROM_EMAIL", "LocalRankr <reports@localrankr.io>")
 MOZ_ACCESS_ID = os.getenv("MOZ_ACCESS_ID", "")
 MOZ_SECRET_KEY = os.getenv("MOZ_SECRET_KEY", "")
 MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "50"))
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
 if not ANTHROPIC_API_KEY:
     logger.warning("⚠️  ANTHROPIC_API_KEY is not set — Claude calls will fail")
@@ -300,6 +302,8 @@ class OAuthSyncRequest(BaseModel):
     email: str
     google_sub: str
     name: Optional[str] = None
+    google_access_token: Optional[str] = None
+    google_refresh_token: Optional[str] = None
 
 
 class ProfileCreateRequest(BaseModel):
@@ -392,6 +396,18 @@ def auth_oauth_sync(body: OAuthSyncRequest):
             # Link Google to an existing email/password account
             user.google_sub = body.google_sub
             db.commit()
+
+        # Store/refresh Google tokens for GSC access
+        updated = False
+        if body.google_access_token and body.google_access_token != user.google_access_token:
+            user.google_access_token = body.google_access_token
+            updated = True
+        if body.google_refresh_token and body.google_refresh_token != user.google_refresh_token:
+            user.google_refresh_token = body.google_refresh_token
+            updated = True
+        if updated:
+            db.commit()
+
         token = _create_token(user.id, user.email)
         return {"id": user.id, "email": user.email, "access_token": token}
     finally:
@@ -1000,18 +1016,128 @@ def _normalize_url(url: str) -> str:
     return urlunparse((p.scheme, p.netloc.lower(), path, "", "", ""))
 
 
+def _convert_advertools_to_pages(df) -> list[dict]:
+    """Convert advertools crawl DataFrame to our standard page dict format."""
+    from urllib.parse import urlparse
+    pages = []
+    for _, row in df.iterrows():
+        url = str(row.get("url", ""))
+        status = int(row.get("status", 0))
+
+        # Parse internal vs external links from advertools columns
+        internal_links = []
+        external_links = []
+        links_url = row.get("links_url")
+        if isinstance(links_url, str):
+            parsed = urlparse(url)
+            for link in links_url.split("@@"):
+                link = link.strip()
+                if not link:
+                    continue
+                link_parsed = urlparse(link)
+                entry = {"href": link, "text": ""}
+                if link_parsed.netloc == parsed.netloc or not link_parsed.netloc:
+                    internal_links.append(entry)
+                else:
+                    external_links.append(entry)
+
+        # Image alt texts
+        img_alts = row.get("img_alt", "")
+        img_alt_list = [a.strip() for a in str(img_alts).split("@@") if a.strip()] if img_alts else []
+
+        # Headings
+        h1 = str(row.get("h1", "")) or ""
+        if "@@" in h1:
+            h1 = h1.split("@@")[0].strip()
+
+        body_text = str(row.get("body_text", "")) if row.get("body_text") else ""
+
+        pages.append({
+            "url": url,
+            "success": status == 200,
+            "status_code": status,
+            "title": str(row.get("title", "")) or "",
+            "meta_description": str(row.get("meta_desc", "")) or "",
+            "h1": h1,
+            "content": body_text[:4000],
+            "word_count": int(row.get("body_text_word_count", 0)) if row.get("body_text_word_count") else len(body_text.split()),
+            "internal_links": internal_links,
+            "external_links": external_links,
+            "canonical": str(row.get("canonical", "")) or None,
+            "redirect_urls": str(row.get("redirect_urls", "")).split("@@") if row.get("redirect_urls") else [],
+            "img_alt_texts": img_alt_list,
+            "download_time": float(row.get("download_latency", 0)) if row.get("download_latency") else None,
+        })
+    return pages
+
+
 async def crawl_site(start_url: str, max_pages: int = 50) -> list[dict]:
-    """Crawl a site using sitemap URLs first, then BFS fallback for discovery.
+    """Crawl a site using advertools (Scrapy-based), falling back to BFS crawler.
 
-    Strategy:
-    1. Fetch sitemap.xml and extract URLs (same domain, HTML only)
-    2. Seed the crawl queue with sitemap URLs
-    3. If no sitemap or empty, fall back to BFS from start_url
-    4. Always include the start_url (homepage) first
-
-    Fetches pages in batches of 5 concurrently.
-    Returns list of scrape_page() dicts where success=True.
+    advertools runs in a subprocess because Scrapy's Twisted reactor conflicts with asyncio.
     """
+    try:
+        import advertools  # noqa: F401 — check if installed
+        return await _crawl_site_advertools(start_url, max_pages)
+    except ImportError:
+        logger.info("advertools not installed — using built-in BFS crawler")
+        return await crawl_site_basic(start_url, max_pages)
+    except Exception as e:
+        logger.warning(f"advertools crawl failed ({e}) — falling back to BFS crawler")
+        return await crawl_site_basic(start_url, max_pages)
+
+
+async def _crawl_site_advertools(start_url: str, max_pages: int = 50) -> list[dict]:
+    """Run advertools crawl in subprocess and parse results."""
+    output_file = f"/tmp/crawl_{uuid.uuid4().hex}.jl"
+
+    crawl_script = (
+        "import advertools as adv\n"
+        f"adv.crawl(\n"
+        f"    '{start_url}',\n"
+        f"    '{output_file}',\n"
+        f"    follow_links=True,\n"
+        f"    custom_settings={{\n"
+        f"        'CLOSESPIDER_PAGECOUNT': {max_pages},\n"
+        f"        'CONCURRENT_REQUESTS': 5,\n"
+        f"        'DOWNLOAD_DELAY': 0.25,\n"
+        f"        'DEPTH_LIMIT': 5,\n"
+        f"        'USER_AGENT': 'SEOSaasBot/1.0',\n"
+        f"        'LOG_LEVEL': 'WARNING',\n"
+        f"    }}\n"
+        f")\n"
+    )
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", crawl_script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+    if proc.returncode != 0:
+        logger.warning(f"advertools crawl subprocess failed: {stderr.decode()[:300]}")
+        raise RuntimeError("advertools crawl subprocess failed")
+
+    # Parse the output file
+    import pandas as pd
+    if not os.path.exists(output_file):
+        raise RuntimeError("advertools crawl produced no output file")
+
+    df = pd.read_json(output_file, lines=True)
+    pages = _convert_advertools_to_pages(df)
+
+    try:
+        os.unlink(output_file)
+    except OSError:
+        pass
+
+    logger.info(f"advertools crawl complete: {len(pages)} pages from {start_url}")
+    return pages
+
+
+async def crawl_site_basic(start_url: str, max_pages: int = 50) -> list[dict]:
+    """BFS fallback crawler — original implementation using sitemap + link discovery."""
     from urllib.parse import urlparse
 
     parsed_start = urlparse(start_url)
@@ -1022,14 +1148,12 @@ async def crawl_site(start_url: str, max_pages: int = 50) -> list[dict]:
     queue: list[str] = [start_url]
     pages: list[dict] = []
 
-    # Try sitemap-first strategy: seed queue with sitemap URLs
     crawl_strategy = "bfs"
     try:
         robots_sitemap = await fetch_robots_and_sitemap(start_url)
         sitemap_urls = robots_sitemap.get("sitemap_xml", {}).get("urls", [])
         if sitemap_urls:
             crawl_strategy = "sitemap"
-            # Add sitemap URLs to queue (after start_url to keep homepage first)
             for u in sitemap_urls:
                 norm = _normalize_url(u)
                 start_norm = _normalize_url(start_url)
@@ -1040,7 +1164,6 @@ async def crawl_site(start_url: str, max_pages: int = 50) -> list[dict]:
         logger.warning(f"Sitemap fetch failed during crawl, using BFS only: {e}")
 
     while queue and len(pages) < max_pages:
-        # Build a batch of up to 5 unvisited URLs
         batch: list[str] = []
         while queue and len(batch) < 5:
             url = queue.pop(0)
@@ -1061,7 +1184,6 @@ async def crawl_site(start_url: str, max_pages: int = 50) -> list[dict]:
                 continue
             pages.append(result)
 
-            # Discover new internal links (BFS expansion — works for both strategies)
             for link in result.get("internal_links", []):
                 href = link.get("href", "")
                 if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
@@ -1073,7 +1195,6 @@ async def crawl_site(start_url: str, max_pages: int = 50) -> list[dict]:
                 else:
                     continue
 
-                # Skip non-HTML resources
                 if any(href.endswith(ext) for ext in (".pdf", ".jpg", ".png", ".gif", ".svg", ".zip", ".xml")):
                     continue
 
@@ -1170,6 +1291,13 @@ def aggregate_crawl_results(pages: list[dict]) -> dict:
         pt = p.get("page_type", "Page")
         page_types[pt] = page_types.get(pt, 0) + 1
 
+    # Advertools-specific metrics (available when crawled with advertools)
+    redirect_pages = [p["url"] for p in pages if p.get("redirect_urls")]
+    error_pages = [p["url"] for p in pages if p.get("status_code") and p["status_code"] >= 400]
+    missing_canonical = sum(1 for p in pages if p.get("success") and not p.get("canonical"))
+    download_times = [p["download_time"] for p in pages if p.get("download_time") is not None]
+    avg_download_time = round(sum(download_times) / len(download_times), 2) if download_times else None
+
     return {
         "pages_crawled": total,
         "missing_title": missing_title,
@@ -1180,6 +1308,13 @@ def aggregate_crawl_results(pages: list[dict]) -> dict:
         "thin_content_pages": thin_pages[:10],
         "coverage_score": max(0, coverage_score),
         "page_types": page_types,
+        # New metrics from advertools crawler
+        "redirect_pages_count": len(redirect_pages),
+        "redirect_pages": redirect_pages[:10],
+        "error_pages_count": len(error_pages),
+        "error_pages": error_pages[:10],
+        "missing_canonical_count": missing_canonical,
+        "avg_download_time": avg_download_time,
     }
 
 
@@ -1240,7 +1375,102 @@ async def fetch_moz_metrics(url: str) -> dict | None:
         return None
 
 
+def _parse_lighthouse_categories(cats: dict, audits: dict) -> dict:
+    """Parse Lighthouse category scores and audit metrics into our standard format."""
+    def ms(audit_id: str) -> str | None:
+        a = audits.get(audit_id, {})
+        disp = a.get("displayValue")
+        return disp if disp else None
+
+    # Top 5 opportunities by estimated savings
+    opportunities = []
+    for audit_id, audit in audits.items():
+        if audit.get("details", {}).get("type") == "opportunity":
+            savings_ms = audit.get("details", {}).get("overallSavingsMs", 0) or 0
+            if savings_ms > 0:
+                opportunities.append({
+                    "id": audit_id,
+                    "title": audit.get("title", audit_id),
+                    "savings_ms": round(savings_ms),
+                    "description": audit.get("description", "")[:120],
+                })
+    opportunities.sort(key=lambda x: x["savings_ms"], reverse=True)
+
+    # SEO audit items (from Lighthouse SEO category)
+    seo_issues = []
+    seo_cat = cats.get("seo", {})
+    for ref in seo_cat.get("auditRefs", []):
+        aid = ref.get("id", "")
+        audit = audits.get(aid, {})
+        if audit.get("score") is not None and audit["score"] < 1:
+            seo_issues.append({
+                "id": aid,
+                "title": audit.get("title", aid),
+                "description": audit.get("description", "")[:120],
+            })
+
+    return {
+        "performance_score": round((cats.get("performance", {}).get("score") or 0) * 100),
+        "seo_score": round((cats.get("seo", {}).get("score") or 0) * 100),
+        "accessibility_score": round((cats.get("accessibility", {}).get("score") or 0) * 100),
+        "best_practices_score": round((cats.get("best-practices", {}).get("score") or 0) * 100),
+        "lcp": ms("largest-contentful-paint"),
+        "inp": ms("interaction-to-next-paint") or ms("total-blocking-time"),
+        "cls": ms("cumulative-layout-shift"),
+        "fcp": ms("first-contentful-paint"),
+        "ttfb": ms("server-response-time"),
+        "opportunities": opportunities[:5],
+        "seo_issues": seo_issues,
+    }
+
+
+async def fetch_lighthouse(url: str) -> dict | None:
+    """Run Lighthouse locally via Node.js subprocess. No API key needed.
+    Returns None if Lighthouse is not installed or fails."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "lighthouse", url,
+            "--output=json",
+            "--chrome-flags=--headless --no-sandbox",
+            "--only-categories=performance,seo,accessibility,best-practices",
+            "--quiet",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(stdout)
+        cats = data.get("categories", {})
+        audits = data.get("audits", {})
+        parsed = _parse_lighthouse_categories(cats, audits)
+        parsed["source"] = "lighthouse_local"
+        parsed["success"] = True
+        return parsed
+    except (FileNotFoundError, asyncio.TimeoutError, json.JSONDecodeError, Exception) as e:
+        logger.debug(f"Local Lighthouse not available for {url}: {e}")
+        return None
+
+
 async def fetch_pagespeed(url: str) -> dict:
+    """Fetch performance data: try local Lighthouse first, fall back to PSI API."""
+
+    # Try local Lighthouse first (unlimited, no API key needed)
+    lh_result = await fetch_lighthouse(url)
+    if lh_result and lh_result.get("success"):
+        return {
+            "mobile": lh_result,  # Lighthouse default is mobile emulation
+            "desktop": {},
+            "success": True,
+            "error": None,
+            "source": "lighthouse_local",
+        }
+
+    # Fall back to Google PSI API
+    return await _fetch_pagespeed_api(url)
+
+
+async def _fetch_pagespeed_api(url: str) -> dict:
     """Call Google PageSpeed Insights API (free, no key) for mobile + desktop."""
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     result = {
@@ -1248,44 +1478,13 @@ async def fetch_pagespeed(url: str) -> dict:
         "desktop": {},
         "success": False,
         "error": None,
+        "source": "pagespeed_api",
     }
 
     def _parse_strategy(data: dict) -> dict:
         cats = data.get("lighthouseResult", {}).get("categories", {})
         audits = data.get("lighthouseResult", {}).get("audits", {})
-
-        def ms(audit_id: str) -> str | None:
-            a = audits.get(audit_id, {})
-            disp = a.get("displayValue")
-            return disp if disp else None
-
-        def score(audit_id: str) -> float | None:
-            s = audits.get(audit_id, {}).get("score")
-            return round(s * 100) if s is not None else None
-
-        # Top 5 opportunities by estimated savings
-        opportunities = []
-        for audit_id, audit in audits.items():
-            if audit.get("details", {}).get("type") == "opportunity":
-                savings_ms = audit.get("details", {}).get("overallSavingsMs", 0) or 0
-                if savings_ms > 0:
-                    opportunities.append({
-                        "id": audit_id,
-                        "title": audit.get("title", audit_id),
-                        "savings_ms": round(savings_ms),
-                        "description": audit.get("description", "")[:120],
-                    })
-        opportunities.sort(key=lambda x: x["savings_ms"], reverse=True)
-
-        return {
-            "performance_score": round((cats.get("performance", {}).get("score") or 0) * 100),
-            "lcp": ms("largest-contentful-paint"),
-            "inp": ms("interaction-to-next-paint") or ms("total-blocking-time"),
-            "cls": ms("cumulative-layout-shift"),
-            "fcp": ms("first-contentful-paint"),
-            "ttfb": ms("server-response-time"),
-            "opportunities": opportunities[:5],
-        }
+        return _parse_lighthouse_categories(cats, audits)
 
     try:
         psi_key = os.getenv("PAGESPEED_API_KEY")
@@ -1549,14 +1748,29 @@ async def scrape_technical_signals(url: str) -> dict:
             tw[tag.get("name")] = tag.get("content", "")[:100]
         signals["twitter_tags"] = tw
 
-        # Structured data
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                schema = json.loads(script.string or "{}")
-                schema_type = schema.get("@type") or schema.get("@graph", [{}])[0].get("@type", "Unknown")
-                signals["schemas"].append(schema_type)
-            except (json.JSONDecodeError, IndexError):
-                signals["schemas"].append("Unknown")
+        # Structured data — use extruct for comprehensive extraction
+        try:
+            import extruct
+            structured = extruct.extract(html, base_url=url, syntaxes=["json-ld", "microdata", "rdfa"])
+            for item in structured.get("json-ld", []):
+                t = item.get("@type", "Unknown")
+                signals["schemas"].append(t if isinstance(t, str) else str(t))
+            for item in structured.get("microdata", []):
+                t = item.get("type", "")
+                if t:
+                    signals["schemas"].append(t.split("/")[-1])
+            for item in structured.get("rdfa", []):
+                t = item.get("@type", [])
+                types = t if isinstance(t, list) else [t]
+                signals["schemas"].extend([x for x in types if x])
+        except ImportError:
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    schema = json.loads(script.string or "{}")
+                    schema_type = schema.get("@type") or schema.get("@graph", [{}])[0].get("@type", "Unknown")
+                    signals["schemas"].append(schema_type)
+                except (json.JSONDecodeError, IndexError):
+                    signals["schemas"].append("Unknown")
 
         # Images
         imgs = soup.find_all("img")
@@ -1934,7 +2148,11 @@ Rules:
 
 
 @app.post("/agents/keyword-research")
-async def keyword_research_agent(request: AuditRequest, secondary_keywords: list[str] | None = None):
+async def keyword_research_agent(
+    request: AuditRequest,
+    secondary_keywords: list[str] | None = None,
+    gsc_access_token: str | None = None,
+):
     """Keyword Research Agent — density, semantic keywords, gap analysis, clusters."""
     audit_id = str(uuid.uuid4())
     logger.info(f"[{audit_id}] Keyword Research starting for '{request.keyword}'")
@@ -1945,6 +2163,11 @@ async def keyword_research_agent(request: AuditRequest, secondary_keywords: list
         fetch_competitors(request.keyword, request.location),
     )
     competitor_data = await scrape_competitors(competitors)
+
+    # Fetch GSC data if user has connected their account
+    gsc_data = None
+    if gsc_access_token:
+        gsc_data = await _fetch_gsc_data(gsc_access_token, request.target_url)
 
     # Calculate keyword density from scraped page text
     client_content = page_data.get("content", "")
@@ -1974,9 +2197,23 @@ async def keyword_research_agent(request: AuditRequest, secondary_keywords: list
     if secondary_keywords:
         prompt += f"\n\nAlso analyze these related keywords detected from the website: {', '.join(secondary_keywords)}"
 
+    # Append real GSC keyword data when available
+    if gsc_data and gsc_data.get("keywords"):
+        top_kw = gsc_data["keywords"][:20]
+        gsc_lines = [
+            f"  {kw['query']} — {kw['clicks']} clicks, {kw['impressions']} impressions, "
+            f"CTR {kw['ctr']}%, avg position {kw['position']}"
+            for kw in top_kw
+        ]
+        prompt += (
+            "\n\nREAL GOOGLE SEARCH CONSOLE DATA (last 90 days):\n"
+            + "\n".join(gsc_lines)
+            + "\nUse this real data instead of estimating search volumes."
+        )
+
     recommendations = await call_claude(KEYWORD_SYSTEM, prompt, max_tokens=4000)
 
-    return {
+    result = {
         "agent": "keyword_research",
         "audit_id": audit_id,
         "status": "completed",
@@ -1986,6 +2223,9 @@ async def keyword_research_agent(request: AuditRequest, secondary_keywords: list
         "recommendations": recommendations,
         "timestamp": datetime.now().isoformat(),
     }
+    if gsc_data:
+        result["gsc_data"] = gsc_data
+    return result
 
 
 # =============================================================================
@@ -3245,35 +3485,74 @@ Rules:
 - Every answer in faq_content mentions {location} at least once"""
 
 
-def _extract_schema_and_eeat(soup) -> dict:
-    """Extract JSON-LD schema types and E-E-A-T signals from a BeautifulSoup page."""
+def _extract_schema_and_eeat(soup, url: str = "") -> dict:
+    """Extract structured data (JSON-LD, Microdata, RDFa, OpenGraph) and E-E-A-T signals."""
     import re as _re
 
-    # Schema types from JSON-LD
     schema_types: list[str] = []
     has_faq_schema = False
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            raw = tag.string or ""
-            obj = json.loads(raw)
-            if isinstance(obj, dict):
-                t = obj.get("@type", "")
-                if isinstance(t, list):
-                    schema_types.extend(t)
-                elif t:
-                    schema_types.append(t)
-                if "FAQPage" in str(t):
-                    has_faq_schema = True
-            elif isinstance(obj, list):
-                for item in obj:
-                    if isinstance(item, dict):
-                        t = item.get("@type", "")
-                        if t:
-                            schema_types.append(t if isinstance(t, str) else str(t))
-                        if "FAQPage" in str(t):
-                            has_faq_schema = True
-        except (json.JSONDecodeError, TypeError):
-            pass
+    faq_questions: list[dict] = []
+
+    try:
+        import extruct
+        html = str(soup)
+        data = extruct.extract(html, base_url=url, syntaxes=["json-ld", "microdata", "rdfa", "opengraph"])
+
+        # JSON-LD schemas (richest source)
+        for item in data.get("json-ld", []):
+            t = item.get("@type", "")
+            types = t if isinstance(t, list) else [t]
+            schema_types.extend([x for x in types if x])
+            if "FAQPage" in types:
+                has_faq_schema = True
+                for q in item.get("mainEntity", []):
+                    faq_questions.append({
+                        "question": q.get("name", ""),
+                        "answer": q.get("acceptedAnswer", {}).get("text", ""),
+                    })
+
+        # Microdata schemas
+        for item in data.get("microdata", []):
+            t = item.get("type", "")
+            if t:
+                schema_types.append(t.split("/")[-1])
+
+        # RDFa schemas
+        for item in data.get("rdfa", []):
+            t = item.get("@type", [])
+            types = t if isinstance(t, list) else [t]
+            schema_types.extend([x for x in types if x])
+
+        microdata_found = len(data.get("microdata", [])) > 0
+        rdfa_found = len(data.get("rdfa", [])) > 0
+        opengraph = data.get("opengraph", [{}])[0] if data.get("opengraph") else {}
+
+    except ImportError:
+        # Fallback: manual JSON-LD parsing if extruct not installed
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                obj = json.loads(tag.string or "")
+                if isinstance(obj, dict):
+                    t = obj.get("@type", "")
+                    if isinstance(t, list):
+                        schema_types.extend(t)
+                    elif t:
+                        schema_types.append(t)
+                    if "FAQPage" in str(t):
+                        has_faq_schema = True
+                elif isinstance(obj, list):
+                    for item in obj:
+                        if isinstance(item, dict):
+                            t = item.get("@type", "")
+                            if t:
+                                schema_types.append(t if isinstance(t, str) else str(t))
+                            if "FAQPage" in str(t):
+                                has_faq_schema = True
+            except (json.JSONDecodeError, TypeError):
+                pass
+        microdata_found = False
+        rdfa_found = False
+        opengraph = {}
 
     # FAQ content on page (non-schema)
     faq_count = len(soup.find_all("details")) + len(
@@ -3296,14 +3575,61 @@ def _extract_schema_and_eeat(soup) -> dict:
     has_about_page = bool(soup.find("a", href=_re.compile(r"about", _re.I)))
 
     return {
-        "schema_types_found": schema_types,
+        "schema_types_found": list(set(schema_types)),
         "has_faq_schema": has_faq_schema,
+        "faq_questions_extracted": faq_questions,
         "faq_count": faq_count,
+        "microdata_found": microdata_found,
+        "rdfa_found": rdfa_found,
+        "opengraph": opengraph,
         "has_author_bio": has_author_bio,
         "has_credentials": has_credentials,
         "reviews_on_page": reviews_on_page,
         "has_about_page": has_about_page,
     }
+
+
+async def _fetch_gsc_data(access_token: str, site_url: str, days: int = 90) -> dict | None:
+    """Fetch real keyword data from Google Search Console.
+    Returns None if token is invalid or API call fails."""
+    from datetime import date, timedelta
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2.credentials import Credentials
+
+        creds = Credentials(token=access_token)
+        service = build("searchconsole", "v1", credentials=creds)
+
+        response = service.searchanalytics().query(
+            siteUrl=site_url,
+            body={
+                "startDate": (date.today() - timedelta(days=days)).isoformat(),
+                "endDate": date.today().isoformat(),
+                "dimensions": ["query", "page"],
+                "rowLimit": 100,
+            }
+        ).execute()
+
+        return {
+            "keywords": [
+                {
+                    "query": row["keys"][0],
+                    "page": row["keys"][1],
+                    "clicks": row["clicks"],
+                    "impressions": row["impressions"],
+                    "ctr": round(row["ctr"] * 100, 1),
+                    "position": round(row["position"], 1),
+                }
+                for row in response.get("rows", [])
+            ],
+            "source": "google_search_console",
+        }
+    except ImportError:
+        logger.debug("google-api-python-client not installed — GSC data unavailable")
+        return None
+    except Exception as e:
+        logger.warning(f"GSC data fetch failed for {site_url}: {e}")
+        return None
 
 
 async def _fetch_paa(keyword: str, location: str) -> list[dict]:
@@ -3346,7 +3672,7 @@ async def _scrape_for_ai_seo(url: str) -> dict:
         ) as http:
             resp = await http.get(url)
         soup = BeautifulSoup(resp.text, "html.parser")
-        signals = _extract_schema_and_eeat(soup)
+        signals = _extract_schema_and_eeat(soup, url=url)
         text = soup.get_text(separator=" ", strip=True)
         signals["word_count"] = len(text.split())
         return signals
@@ -3660,14 +3986,20 @@ def calculate_pillar_scores(agents: dict) -> dict:
     citation_score = citation.get("plan", {}).get("citation_score", 20)
     citation_score = max(0, min(100, int(citation_score)))
     # Reviews: derive a 0-100 score from count + rating
-    review_count_raw = gbp.get("analysis", {}).get("review_count", 0)
-    if not review_count_raw:
-        review_count_raw = gbp.get("analysis", {}).get("map_pack_status", {}).get("reviews", 0)
-    review_count_val = int(review_count_raw) if review_count_raw else 0
-    avg_rating_raw = gbp.get("analysis", {}).get("avg_rating", 0)
-    if not avg_rating_raw:
-        avg_rating_raw = gbp.get("analysis", {}).get("map_pack_status", {}).get("rating", 0)
-    avg_rating_val = float(avg_rating_raw) if avg_rating_raw else 0.0
+    # Prefer real Google Places data when available, then fall back to Claude analysis
+    places = gbp.get("places_data", {})
+    if places.get("source") == "google_places_api":
+        review_count_val = int(places.get("review_count", 0))
+        avg_rating_val = float(places.get("avg_rating", 0.0))
+    else:
+        review_count_raw = gbp.get("analysis", {}).get("review_count", 0)
+        if not review_count_raw:
+            review_count_raw = gbp.get("analysis", {}).get("map_pack_status", {}).get("reviews", 0)
+        review_count_val = int(review_count_raw) if review_count_raw else 0
+        avg_rating_raw = gbp.get("analysis", {}).get("avg_rating", 0)
+        if not avg_rating_raw:
+            avg_rating_raw = gbp.get("analysis", {}).get("map_pack_status", {}).get("rating", 0)
+        avg_rating_val = float(avg_rating_raw) if avg_rating_raw else 0.0
     # Count component (0-60): 50+ reviews = full marks, scaled linearly
     review_count_component = min(60, int((min(review_count_val, 50) / 50) * 60))
     # Rating component (0-40): 5.0 = full marks, below 3.0 = 0
@@ -5109,6 +5441,61 @@ async def _fetch_serp_rich(keyword: str, location: str, target_url: str) -> dict
 
 
 # ---------------------------------------------------------------------------
+# Google Places API — real GBP data
+# ---------------------------------------------------------------------------
+
+async def _fetch_places_data(business_name: str, location: str) -> dict:
+    """Fetch real business data from Google Places API (New).
+    Returns {"source": "none"} if API key is missing or lookup fails."""
+    if not GOOGLE_PLACES_API_KEY:
+        return {"source": "none"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            search_resp = await http.post(
+                "https://places.googleapis.com/v1/places:searchText",
+                headers={
+                    "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                    "X-Goog-FieldMask": (
+                        "places.id,places.displayName,places.formattedAddress,"
+                        "places.rating,places.userRatingCount,places.photos,"
+                        "places.types,places.currentOpeningHours,places.nationalPhoneNumber,"
+                        "places.websiteUri,places.googleMapsUri,places.businessStatus,"
+                        "places.editorialSummary"
+                    ),
+                },
+                json={"textQuery": f"{business_name} {location}"},
+            )
+            if search_resp.status_code != 200:
+                logger.warning(f"Places API search failed: {search_resp.status_code}")
+                return {"source": "none", "error": f"Places API: {search_resp.status_code}"}
+
+            places = search_resp.json().get("places", [])
+            if not places:
+                return {"source": "none", "error": "No places found"}
+
+            place = places[0]
+
+        return {
+            "review_count": place.get("userRatingCount", 0),
+            "avg_rating": place.get("rating", 0.0),
+            "photos_count": len(place.get("photos", [])),
+            "categories": place.get("types", []),
+            "hours": place.get("currentOpeningHours", {}),
+            "phone": place.get("nationalPhoneNumber", ""),
+            "website": place.get("websiteUri", ""),
+            "address": place.get("formattedAddress", ""),
+            "business_status": place.get("businessStatus", ""),
+            "google_maps_url": place.get("googleMapsUri", ""),
+            "editorial_summary": place.get("editorialSummary", {}).get("text", ""),
+            "source": "google_places_api",
+        }
+    except Exception as e:
+        logger.warning(f"Places API error for '{business_name}': {e}")
+        return {"source": "none", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # 4a — GBP Audit Agent
 # ---------------------------------------------------------------------------
 
@@ -5213,11 +5600,28 @@ async def gbp_audit_agent(request: AuditRequest):
         biz_name = request.business_name or "this business"
         biz_type = request.business_type or "local business"
 
-        # Fetch SERP data + page data concurrently
-        serp_data, page_data = await asyncio.gather(
+        # Fetch SERP data + page data + Places API concurrently
+        serp_data, page_data, places_data = await asyncio.gather(
             _fetch_serp_rich(request.keyword, request.location, request.target_url),
             scrape_page(request.target_url),
+            _fetch_places_data(biz_name, request.location),
         )
+
+        # Format Google Places data for the prompt when available
+        places_str = ""
+        if places_data.get("source") == "google_places_api":
+            places_str = (
+                f"\n\nVERIFIED GOOGLE PLACES DATA:\n"
+                f"  Rating: {places_data.get('avg_rating', 'N/A')}★ ({places_data.get('review_count', 0)} reviews)\n"
+                f"  Photos: {places_data.get('photos_count', 0)}\n"
+                f"  Categories: {', '.join(places_data.get('categories', []))}\n"
+                f"  Phone: {places_data.get('phone', 'N/A')}\n"
+                f"  Address: {places_data.get('address', 'N/A')}\n"
+                f"  Business Status: {places_data.get('business_status', 'N/A')}\n"
+                f"  Hours Set: {'Yes' if places_data.get('hours') else 'No'}\n"
+                f"  Website: {places_data.get('website', 'N/A')}\n"
+                f"  Google Maps: {places_data.get('google_maps_url', 'N/A')}\n"
+            )
 
         # Format map pack competitors
         pack_lines = []
@@ -5259,6 +5663,10 @@ async def gbp_audit_agent(request: AuditRequest):
             content_excerpt=content_excerpt,
         )
 
+        # Append verified Places data so Claude can use real numbers
+        if places_str:
+            prompt += places_str
+
         analysis = await call_claude(GBP_SYSTEM, prompt, max_tokens=4000)
 
         return {
@@ -5271,6 +5679,7 @@ async def gbp_audit_agent(request: AuditRequest):
             "organic_rank": org_rank,
             "serp_features": serp_data.get("serp_features", []),
             "local_pack": serp_data.get("local_pack", []),
+            "places_data": places_data,
             "analysis": analysis,
             "timestamp": datetime.now().isoformat(),
         }
@@ -5620,7 +6029,19 @@ async def _do_audit_core(audit_id: str, request: AuditRequest, current_user) -> 
                 profile_services = [s for s in auto_detected["services"] if isinstance(s, str)]
 
         # Phase 1 — keyword research (other agents benefit from this data)
-        keyword_results = await keyword_research_agent(request, secondary_keywords=secondary_keywords)
+        # Look up user's GSC token if they've connected Google
+        gsc_token = None
+        if current_user:
+            db = SessionLocal()
+            try:
+                user_obj = db.query(User).filter(User.id == current_user["user_id"]).first()
+                if user_obj and getattr(user_obj, "google_access_token", None):
+                    gsc_token = user_obj.google_access_token
+            finally:
+                db.close()
+        keyword_results = await keyword_research_agent(
+            request, secondary_keywords=secondary_keywords, gsc_access_token=gsc_token
+        )
 
         # Phase 2, 3 + 4 — all independent agents run concurrently
         # On-page gets pre-crawled pages sorted by word count (homepage first),

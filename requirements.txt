@@ -13,6 +13,16 @@ anthropic>=0.39.0
 httpx>=0.25.0
 beautifulsoup4>=4.12.2
 lxml>=4.9.3
+extruct>=0.17.0
+
+# Crawling (advertools uses Scrapy — run in subprocess)
+advertools>=0.16.0
+pandas>=2.0.0
+
+# Google APIs
+googlemaps>=4.10.0
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
 
 # Data validation
 pydantic>=2.5.0
